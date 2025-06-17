@@ -1,4 +1,5 @@
 import argparse
+import glob
 import os
 import random
 
@@ -156,9 +157,10 @@ def train_diar_step(
     tau=0.9,
     latent_dim=16,
     ddpm_steps=10,
-    device="cpu"
+    device="cpu",
+    step=None,
 ):
-    batch = replay_buffer.sample()
+    batch = replay_buffer.sample(128)
     s = batch['state'].to(device)
     a = batch['action'].to(device)
     r = batch['reward'].to(device)
@@ -187,6 +189,12 @@ def train_diar_step(
             tp.data.mul_(0.995).add_(0.005 * p.data)
         for p, tp in zip(v_net.parameters(), v_net_target.parameters()):
             tp.data.mul_(0.995).add_(0.005 * p.data)
+
+    if wandb.run:
+        wandb.log({
+            "loss/q": loss_q.item(),
+            "loss/v": loss_v.item(),
+        }, step=step)
 
 # ---------- Policy Execution ----------
 def policy_execute(
@@ -365,7 +373,7 @@ def train_diar(
             replay_buffer, q_net, v_net, q_net_target, v_net_target,
             diffusion_model, beta_vae, optimizer_q, optimizer_v,
             gamma=0.995, tau=0.9, latent_dim=latent_dim,
-            ddpm_steps=10, device=device
+            ddpm_steps=10, device=device, step=step
         )
 
         if step % 500 == 0:
@@ -378,6 +386,17 @@ def train_diar(
             torch.save(v_net.state_dict(), f"{save_dir}/diar/v_net_step{step}.pt")
             torch.save(beta_vae.state_dict(), f"{save_dir}/diar/beta_vae_step{step}.pt")
             torch.save(diffusion_model.state_dict(), f"{save_dir}/diar/diffusion_model_step{step}.pt")
+
+
+def load_latest_checkpoint(model, name, folder="output"):
+    checkpoints = glob.glob(os.path.join(folder, f"{name}_*.pt"))
+    if not checkpoints:
+        print(f"No checkpoint found for {name}")
+        return model
+    latest = max(checkpoints, key=os.path.getmtime)
+    print(f"Loading {name} from {latest}")
+    model.load_state_dict(torch.load(latest))
+    return model
 
 
 if __name__ == "__main__":
@@ -414,11 +433,14 @@ if __name__ == "__main__":
     beta_vae = BetaVAE(state_dim, action_dim, latent_dim).to(args.device)
     diffusion_model = LatentDiffusionModel(latent_dim, state_dim).to(args.device)
 
-    print("=== Training Beta-VAE ===")
-    train_beta_vae(env, dataset, beta_vae, diffusion_model, device=args.device, epochs=100, save_dir=args.save_dir)
+    # print("=== Training Beta-VAE ===")
+    # train_beta_vae(env, dataset, beta_vae, diffusion_model, device=args.device, epochs=100, save_dir=args.save_dir)
 
-    print("=== Training Diffusion Model ===")
-    train_diffusion_model(dataset, beta_vae, diffusion_model, device=args.device, epochs=450, save_dir=args.save_dir)
+    # print("=== Training Diffusion Model ===")
+    # train_diffusion_model(dataset, beta_vae, diffusion_model, device=args.device, epochs=450, save_dir=args.save_dir)
+
+    beta_vae = load_latest_checkpoint(beta_vae, "beta_vae", folder=args.save_dir + "/vae")
+    diffusion_model = load_latest_checkpoint(diffusion_model, "diffusion_model", folder=args.save_dir + "/diffusion")
 
     print("=== Starting DIAR Training ===")
     train_diar(env=env, dataset=dataset, state_dim=state_dim, action_dim=action_dim,
