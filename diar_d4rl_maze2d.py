@@ -1,12 +1,15 @@
+import argparse
+import os
+import random
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import gym
 import d4rl
-import numpy as np
-from torch.utils.data import DataLoader, TensorDataset
-from collections import deque
-import random
+
+import wandb
+from tqdm import trange
 
 # === MLP and Model Definitions: Beta-VAE, Diffusion, QNet, VNet ===
 
@@ -214,7 +217,7 @@ def policy_execute(
                 break
 
         a_np = a.squeeze(0).detach().cpu().numpy()
-        next_state, reward, done, _, _ = env.step(a_np)
+        next_state, reward, done, info = env.step(a_np)
         state = next_state
         total_reward += reward
         t += 1
@@ -240,77 +243,109 @@ class ReplayBuffer:
         }
 
 # === Beta-VAE and Diffusion Training ===
-def train_beta_vae(env, dataset, beta_vae, diffusion_model, device="cuda", epochs=100):
-    state_dim = dataset["observations"].shape[1]
-    action_dim = dataset["actions"].shape[1]
-    latent_dim = 16
-    H = 30  # Horizon length for Maze2D
+def train_beta_vae(
+    env,
+    dataset,
+    beta_vae,
+    diffusion_model,
+    device="cuda",
+    epochs=100,
+    save_every=10,
+    save_dir="output",
+):
+    wandb.watch(beta_vae)
 
-    # Create short sequences of transitions (state_t, action_t, ..., state_{t+H})
-    N = len(dataset["observations"]) - H
-    states_seq = torch.stack([torch.tensor(dataset["observations"][i:i+H], dtype=torch.float32) for i in range(N)])
-    actions_seq = torch.stack([torch.tensor(dataset["actions"][i:i+H], dtype=torch.float32) for i in range(N)])
+    H = 30
+    obs = torch.tensor(dataset["observations"], dtype=torch.float32)
+    acts = torch.tensor(dataset["actions"], dtype=torch.float32)
+    N = len(obs) - H
+    sequences = [(obs[i:i+H], acts[i:i+H]) for i in range(N)]
 
     optimizer = torch.optim.Adam(beta_vae.parameters(), lr=5e-5)
-    batch_size = 128
+    batch_size = 1024
 
-    for epoch in range(epochs):
-        perm = torch.randperm(N)
+    for epoch in trange(epochs, desc="BetaVAE Training"):
+        random.shuffle(sequences)
+        losses = []
+
         for i in range(0, N, batch_size):
-            idx = perm[i:i+batch_size]
-            s = states_seq[idx][:, 0].to(device)
-            a = actions_seq[idx][:, 0].to(device)
+            batch = sequences[i:i+batch_size]
+            s = torch.stack([item[0][0] for item in batch]).to(device)
+            a = torch.stack([item[1][0] for item in batch]).to(device)
             loss = beta_vae.elbo_loss(s, a, beta=0.1, diffusion_model=diffusion_model, steps=10)
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-        if epoch % 10 == 0:
-            print(f"[BetaVAE] Epoch {epoch}, Loss: {loss.item():.4f}")
+            losses.append(loss.item())
 
-def train_diffusion_model(dataset, beta_vae, diffusion_model, device="cuda", epochs=450):
-    state_dim = dataset["observations"].shape[1]
-    action_dim = dataset["actions"].shape[1]
-    latent_dim = 16
+        avg_loss = sum(losses) / len(losses)
+        wandb.log({"beta_vae/elbo_loss": avg_loss}, step=epoch)
+
+        if epoch % save_every == 0 or epoch == epochs - 1:
+            torch.save(beta_vae.state_dict(), f"{save_dir}/vae/beta_vae_epoch{epoch}.pt")
+
+def train_diffusion_model(
+    dataset,
+    beta_vae,
+    diffusion_model,
+    device="cuda",
+    epochs=450,
+    save_every=50,
+    save_dir="output",
+):
+    wandb.watch(diffusion_model)
+
     H = 30
-    N = len(dataset["observations"]) - H
-
-    states_seq = torch.stack([torch.tensor(dataset["observations"][i], dtype=torch.float32) for i in range(N)])
-    actions_seq = torch.stack([torch.tensor(dataset["actions"][i], dtype=torch.float32) for i in range(N)])
-    states_seq = states_seq.to(device)
-    actions_seq = actions_seq.to(device)
+    obs = torch.tensor(dataset["observations"], dtype=torch.float32).to(device)
+    acts = torch.tensor(dataset["actions"], dtype=torch.float32).to(device)
+    N = len(obs) - H
 
     optimizer = torch.optim.Adam(diffusion_model.parameters(), lr=1e-4)
-    batch_size = 128
+    batch_size = 1024
 
-    for epoch in range(epochs):
-        perm = torch.randperm(N)
+    for epoch in trange(epochs, desc="Diffusion Training"):
+        indices = torch.randperm(N)
+        losses = []
+
         for i in range(0, N, batch_size):
-            idx = perm[i:i+batch_size]
-            s = states_seq[idx]
-            a = actions_seq[idx]
+            idx = indices[i:i+batch_size]
+            s = obs[idx]
+            a = acts[idx]
             with torch.no_grad():
                 z, _, _ = beta_vae.encode(s, a)
-            t = torch.randint(1, 11, (z.shape[0],), device=z.device)
+            t = torch.randint(1, 11, (z.shape[0],), device=device)
             z_j = z + torch.randn_like(z) * (1.0 / 10)**0.5
-            loss = F.mse_loss(diffusion_model(z_j, s, t), z)
+            pred = diffusion_model(z_j, s, t)
+            loss = F.mse_loss(pred, z)
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-        if epoch % 50 == 0:
-            print(f"[Diffusion] Epoch {epoch}, Loss: {loss.item():.4f}")
+            losses.append(loss.item())
+
+        avg_loss = sum(losses) / len(losses)
+        wandb.log({"diffusion/loss": avg_loss}, step=epoch)
+
+        if epoch % save_every == 0 or epoch == epochs - 1:
+            torch.save(diffusion_model.state_dict(), f"{save_dir}/diffusion/diffusion_model_epoch{epoch}.pt")
 
 # === Training Script ===
-def train_diar(env_name="maze2d-umaze-v1", num_steps=100_000, device="cuda"):
-    env = gym.make(env_name)
-    dataset = env.get_dataset()
+def train_diar(
+    env,
+    dataset,
+    state_dim,
+    action_dim,
+    latent_dim=16,
+    beta_vae=None,
+    diffusion_model=None,
+    num_steps=100_000,
+    device="cuda",
+    save_every=10000,
+    save_dir="output",
+):
     replay_buffer = ReplayBuffer(dataset, device)
 
-    state_dim = dataset["observations"].shape[1]
-    action_dim = dataset["actions"].shape[1]
-    latent_dim = 16
-
-    beta_vae = BetaVAE(state_dim, action_dim, latent_dim).to(device)
-    diffusion_model = LatentDiffusionModel(latent_dim, state_dim).to(device)
+    beta_vae = beta_vae or BetaVAE(state_dim, action_dim, latent_dim).to(device)
+    diffusion_model = diffusion_model or LatentDiffusionModel(latent_dim, state_dim).to(device)
     q_net = DoubleQNet(state_dim, latent_dim).to(device)
     v_net = ValueNet(state_dim).to(device)
     q_net_target = DoubleQNet(state_dim, latent_dim).to(device)
@@ -322,7 +357,10 @@ def train_diar(env_name="maze2d-umaze-v1", num_steps=100_000, device="cuda"):
     optimizer_q = torch.optim.Adam(q_net.parameters(), lr=5e-4)
     optimizer_v = torch.optim.Adam(v_net.parameters(), lr=5e-4)
 
-    for step in range(num_steps):
+    wandb.watch([q_net, v_net])
+
+    pbar = trange(num_steps, desc="DIAR Training")
+    for step in pbar:
         train_diar_step(
             replay_buffer, q_net, v_net, q_net_target, v_net_target,
             diffusion_model, beta_vae, optimizer_q, optimizer_v,
@@ -330,21 +368,44 @@ def train_diar(env_name="maze2d-umaze-v1", num_steps=100_000, device="cuda"):
             ddpm_steps=10, device=device
         )
 
-        if step % 5000 == 0:
+        if step % 500 == 0:
             reward = policy_execute(env, q_net, v_net, beta_vae, diffusion_model, device=device)
-            print(f"Step {step}, Eval Reward: {reward:.2f}")
+            wandb.log({"eval/reward": reward}, step=step)
+            pbar.set_postfix({"eval_reward": reward})
+
+        if step % save_every == 0 or step == num_steps - 1:
+            torch.save(q_net.state_dict(), f"{save_dir}/diar/q_net_step{step}.pt")
+            torch.save(v_net.state_dict(), f"{save_dir}/diar/v_net_step{step}.pt")
+            torch.save(beta_vae.state_dict(), f"{save_dir}/diar/beta_vae_step{step}.pt")
+            torch.save(diffusion_model.state_dict(), f"{save_dir}/diar/diffusion_model_step{step}.pt")
 
 
 if __name__ == "__main__":
-    import argparse
-
     parser = argparse.ArgumentParser()
     parser.add_argument("--env", type=str, default="maze2d-umaze-v1")
     parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--save_dir", type=str, default="output")
     args = parser.parse_args()
+
+    wandb.init(project="diar", name="diar_run")
+
+    os.makedirs(args.save_dir, exist_ok=True)
+    os.makedirs(args.save_dir + "/vae", exist_ok=True)
+    os.makedirs(args.save_dir + "/diffusion", exist_ok=True)
+    os.makedirs(args.save_dir + "/diar", exist_ok=True)
 
     env = gym.make(args.env)
     dataset = env.get_dataset()
+    if "next_observations" not in dataset:
+        print("Generating next_observations from observations...")
+        dataset["next_observations"] = dataset["observations"][1:]
+        dataset["observations"] = dataset["observations"][:-1]
+        dataset["actions"] = dataset["actions"][:-1]
+        dataset["rewards"] = dataset["rewards"][:-1]
+        if "terminals" in dataset:
+            dataset["terminals"] = dataset["terminals"][:-1]
+        if "timeouts" in dataset:
+            dataset["timeouts"] = dataset["timeouts"][:-1]
 
     state_dim = dataset["observations"].shape[1]
     action_dim = dataset["actions"].shape[1]
@@ -354,11 +415,12 @@ if __name__ == "__main__":
     diffusion_model = LatentDiffusionModel(latent_dim, state_dim).to(args.device)
 
     print("=== Training Beta-VAE ===")
-    train_beta_vae(env, dataset, beta_vae, diffusion_model, device=args.device, epochs=100)
+    train_beta_vae(env, dataset, beta_vae, diffusion_model, device=args.device, epochs=100, save_dir=args.save_dir)
 
     print("=== Training Diffusion Model ===")
-    train_diffusion_model(dataset, beta_vae, diffusion_model, device=args.device, epochs=450)
+    train_diffusion_model(dataset, beta_vae, diffusion_model, device=args.device, epochs=450, save_dir=args.save_dir)
 
     print("=== Starting DIAR Training ===")
-    train_diar(env_name=args.env, num_steps=100000, device=args.device)
-
+    train_diar(env=env, dataset=dataset, state_dim=state_dim, action_dim=action_dim,
+               latent_dim=latent_dim, beta_vae=beta_vae, diffusion_model=diffusion_model,
+               num_steps=100000, device=args.device, save_dir=args.save_dir)
