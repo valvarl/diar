@@ -5,6 +5,7 @@ import os
 import random
 from typing import Optional, Tuple
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -30,6 +31,45 @@ def mlp(in_dim: int, hidden: Tuple[int, ...], out_dim: int) -> nn.Sequential:
 # ---------------------------------------------------------------------------
 # β‑VAE (Bi‑GRU encoder, policy/state decoders, state prior)
 # ---------------------------------------------------------------------------
+
+class TransformerPrior(nn.Module):
+    """
+    200-step diffusion prior из β-VAE-фазы.
+    Векторное (не 2-D) U-Net здесь заменён 2-блочным Transformer-еncoder’ом.
+    """
+    def __init__(self, latent_dim: int, state_dim: int, n_layers: int = 2,
+                 n_heads: int = 4, d_model: int = 256, d_ff: int = 512):
+        super().__init__()
+        self.latent_dim = latent_dim
+
+        # --- эмбеддинги ----------------------------------------------------
+        self.latent_proj = nn.Linear(latent_dim, d_model)
+        self.state_proj  = nn.Linear(state_dim , d_model)
+        self.time_emb    = nn.Embedding(201, d_model)       # t ∈ [0,200]
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=n_heads, dim_feedforward=d_ff,
+            activation="gelu", norm_first=True, batch_first=True)
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+
+        self.out = nn.Linear(d_model, latent_dim)
+
+    def forward(self, z_t, s, t):
+        """
+        z_t : (B, latent_dim)  — зашумлённый латент
+        s   : (B, state_dim)   — текущий state
+        t   : (B,)             — integer timestep 1…200
+        """
+        # два токена: [state, latent]; добавляем time-embedding к **обоим**
+        z_tok = self.latent_proj(z_t)
+        s_tok = self.state_proj(s)
+        te    = self.time_emb(t)
+
+        tokens = torch.stack([s_tok + te, z_tok + te], dim=1)  # (B, 2, d_model)
+        h = self.encoder(tokens)                               # (B, 2, d_model)
+
+        z0_pred = self.out(h[:, 1])        # берём позицию «latent»
+        return z0_pred
 
 class EncoderGRU(nn.Module):
     def __init__(self, in_dim: int, latent_dim: int):
@@ -69,42 +109,74 @@ class BetaVAE(nn.Module):
         h = self.state_prior(s)
         return h.chunk(2, dim=-1)
 
-    def elbo_loss(self, s_seq, a_seq, beta: float = 0.1, lambda_state: float = 1.0,
-                  diffusion_model: Optional[nn.Module] = None, steps: int = 200):
-        """ELBO from Eq.(2) **plus** optional diffusion-prior consistency.
-        The extra term corresponds to the 200-step transformer prior described
-        in Appendix A (we approximate it with the passed *diffusion_model*).
-        Args:
-            s_seq, a_seq    : (B, H, D) sequences (H=30 for Maze2D)
-            beta            : β-VAE weight for KL term (0.1)
-            lambda_state    : weight for state reconstruction (1.0)
-            diffusion_model : if provided, adds L4 term ‖z_T - z‖² (see paper)
-            steps           : number of noising steps (default 200)
+    def elbo_loss(
+        self,
+        s_seq: torch.Tensor,                # (B, H, s_dim)
+        a_seq: torch.Tensor,                # (B, H, a_dim)
+        beta: float = 0.1,
+        lambda_state: float = 1.0,
+        diff_prior: Optional[nn.Module] = None,   # ⟵ prior, участвует в градиентах
+        steps: int = 200,
+        gamma_snr: float = 5.0
+    ):
         """
-        z, mu, logvar = self.encode(s_seq, a_seq)                 # (B, latent)
-        s0 = s_seq[:, 0]; sH = s_seq[:, -1]
-        # reconstructions ---------------------------------------------------
-        rec_a = self.decode_action(s0, z)
-        rec_s = self.decode_state(s0, z)
-        # KL with state prior ----------------------------------------------
+        L = L_a + λ_s·L_s + β·KL + L₄           (см. Eq.(1) + алгоритм 3)
+        """
+        B, H, _ = s_seq.shape
+        device  = s_seq.device
+        state_dim = s_seq.size(-1)
+        action_dim = a_seq.size(-1)
+
+        # --------------------------- Encode -----------------------------------
+        z, mu, logvar = self.encode(s_seq, a_seq)       # (B, latent)
+        s0, sH = s_seq[:, 0], s_seq[:, -1]
+
+        # ----------- Reconstruction of the whole action sequence --------------
+        s_rep = s_seq.reshape(-1, state_dim)            # (B·H, s_dim)
+        z_rep = z.repeat_interleave(H, dim=0)           # (B·H, latent)
+        a_pred = self.decode_action(s_rep, z_rep)
+        l_a = F.mse_loss(a_pred,
+                        a_seq.reshape(-1, action_dim),
+                        reduction='none').sum(-1).view(B, H).sum(-1)   # (B,)
+
+        # ------------------ Reconstruction of the future state ----------------
+        s_pred = self.decode_state(s0, z)
+        l_s    = F.mse_loss(s_pred, sH, reduction='none').sum(-1)       # (B,)
+
+        # ------------------------------- KL -----------------------------------
         p_mu, p_logv = self.prior(s0)
-        kl = -0.5 * (1 + logvar - p_logv - ((mu - p_mu) ** 2 + logvar.exp()) / p_logv.exp()).sum(-1)
-        # additional diffusion‑prior term (optional) ------------------------
-        if diffusion_model is not None:
+        kl = -0.5 * (
+            1 + logvar - p_logv - ((mu - p_mu) ** 2 + logvar.exp()) / p_logv.exp()
+        ).sum(-1)                                                       # (B,)
+
+        # ------------------ Diffusion-prior regulariser (L₄) ------------------
+        if diff_prior is not None:
+            # --- выбираем случайный шаг j для каждого объекта -----------------
+            t_int = torch.randint(1, steps + 1, (B,), device=device)    # (B,)
             beta_t  = 1.0 / steps
-            alpha_t = 1.0 - beta_t
-            z_t = z.clone()
-            for t in reversed(range(1, steps + 1)):
-                tt = torch.full((z_t.size(0),), t, device=z_t.device)
-                z0_pred = diffusion_model(z_t, s0, tt)
-                z_t = alpha_t * z0_pred + (1 - alpha_t) * z_t  # denoise one step
-            l4 = F.mse_loss(z_t, z, reduction='none').sum(-1)
+            alpha   = 1.0 - beta_t
+            alpha_bar_t = alpha ** t_int.float()                        # (B,)
+
+            # --- добавляем гауссов шум ----------------------------------------
+            eps   = torch.randn_like(z)                                 # (B, latent)
+            z_t   = (alpha_bar_t.sqrt().unsqueeze(1) * z +
+                    (1 - alpha_bar_t).sqrt().unsqueeze(1) * eps)       # (B, latent)
+
+            # --- denoise ------------------------------------------------------
+            z0_pred = diff_prior(z_t, s0, t_int)                   # (B, latent)
+
+            # --- Min-SNR-γ вес -----------------------------------------------
+            snr = alpha_bar_t / (1.0 - alpha_bar_t)                     # (B,)
+            weight = torch.minimum(snr, torch.full_like(snr, gamma_snr))
+
+            l4 = (weight.unsqueeze(1) *
+                (z0_pred - z).pow(2)).sum(-1)                         # (B,)
         else:
-            l4 = 0.0
-        # final ELBO --------------------------------------------------------
-        l_a = F.mse_loss(rec_a, a_seq[:, 0], reduction='none').sum(-1)
-        l_s = F.mse_loss(rec_s, sH, reduction='none').sum(-1)
-        return (l_a + lambda_state * l_s + beta * kl + l4).mean()
+            l4 = torch.zeros_like(l_a)                                  # (B,)
+
+        # ----------------------------- ELBO -----------------------------------
+        loss = (l_a + lambda_state * l_s + beta * kl + l4).mean()
+        return loss
 
 
 # ---------------------------------------------------------------------------
@@ -198,28 +270,9 @@ class ValueNet(nn.Module):
         return self.v(self.enc(s)).squeeze(-1)
 
 # ---------- Losses ----------
-def expectile_loss(q_val, v_val, tau=0.9):
-    u = q_val - v_val
-    weight = torch.where(u > 0, tau, 1 - tau)
-    return (weight * u**2).mean()
-
-def compute_q_loss(q_net_target, v_net_target, s, z, r, s_next, gamma=0.99):
-    with torch.no_grad():
-        v_target = v_net_target(s_next)
-        q_target = r + gamma * v_target
-    q1, q2 = q_net_target(s, z)
-    return F.mse_loss(torch.min(q1, q2), q_target)
-
-# def sample_n_latents(diffusion_model, s, n=500, latent_dim=16, steps=10):
-#     B = s.size(0)
-#     s_rep = s.repeat_interleave(n, dim=0)             # (B*n, state_dim)
-#     z_rep = ddpm_sample(diffusion_model, s_rep,
-#                         latent_dim=latent_dim, steps=steps)  # (B*n, latent_dim)
-#     return z_rep.view(B, n, latent_dim)               # (B, n, latent_dim)
-
 def compute_v_loss(q_net_t, v_net, s,
                    z_ddpm, z_data,
-                   k=100, tau=0.9, lambda_v=0.1,
+                   k=100, tau=0.9, lambda_v=0.5,  # λ_v = 0.5 как в цикле
                    return_stats=False):
     """
     z_ddpm : (B, n_d, latent)   – латенты генератора
@@ -240,8 +293,6 @@ def compute_v_loss(q_net_t, v_net, s,
 
         # ---- top-k фильтр -------------------------------------------------
         topk_q, idx = torch.topk(q_vals, k=min(k, n_all), dim=1)
-        z_sel  = torch.gather(z_all, 1,
-                              idx.unsqueeze(-1).expand(-1, -1, z_all.shape[-1]))
         q_sel  = topk_q                                   # (B, k)
 
     v_pred = v_net(s).unsqueeze(1)                    # (B,1)
@@ -255,89 +306,7 @@ def compute_v_loss(q_net_t, v_net, s,
         q_mean   = q_sel.mean().detach()
         return loss, gap, v_mean, q_mean, v_pred.detach(), q_sel.detach()
     return loss
-# -----------------------------------------------------------
-# TRAINING-STEP
-# -----------------------------------------------------------
-def train_diar_step(
-    replay_buffer,
-    q_net, v_net,
-    q_net_target, v_net_target,
-    diffusion_model, beta_vae,
-    optimizer_q, optimizer_v,
-    tau_now,                           # <-- адаптивный τ передаётся извне
-    gamma=0.995,
-    latent_dim=16, ddpm_steps=10,
-    device="cpu", step=0,
-    gap_stop=-2.5                     # порог runaway-guard
-):
-    # -------- sample batch --------------------------------------------------
-    batch   = replay_buffer.sample(128)
-    s, a    = batch['state'], batch['action']
-    r, s_n  = batch['reward'], batch['next_state']
-    w, idxs = batch['weights'], batch['indices']
 
-    # -------- Q-update ------------------------------------------------------
-    with torch.no_grad():
-        z, _, _   = beta_vae.encode(s, a)
-        v_tar  = v_net_target(s_n)
-        q_target = torch.clamp(r + gamma * v_tar, -100.0, 100.0)
-
-    q1, q2     = q_net(s, z)
-    q_pred     = torch.min(q1, q2)
-    td_error   = q_target - q_pred
-    loss_q     = (w * td_error.pow(2).unsqueeze(1)).mean()
-
-    optimizer_q.zero_grad()
-    loss_q.backward()
-    optimizer_q.step()
-
-    # PER приоритеты
-    with torch.no_grad():
-        replay_buffer.update_priorities(idxs, td_error.abs() + 1e-6)
-
-    # -------- V-update ------------------------------------------------------
-    with torch.no_grad():
-        z_ddpm = sample_n_latents(diffusion_model, s,
-                                  n=500, latent_dim=latent_dim,
-                                  steps=ddpm_steps)                  # (B,500,L)
-        # 32 латентов из датасета
-        z_data, _, _ = beta_vae.encode(s, a)
-        z_data = z_data.unsqueeze(1).expand(-1, 32, -1)              # (B,32,L)
-
-    loss_v, expect_gap, v_mean, q_mean, v_pred, q_sel = compute_v_loss(
-        q_net_target, v_net, s,
-        z_ddpm, z_data,
-        k=100, tau=tau_now,
-        lambda_v=0.5, return_stats=True)
-
-    if expect_gap < -2.5:      # runaway-guard
-        loss_v = torch.zeros_like(loss_v)
-
-    optimizer_v.zero_grad()
-    loss_v.backward()
-    torch.nn.utils.clip_grad_norm_(v_net.parameters(), 1.0)
-    optimizer_v.step()
-
-    # -------- soft target ---------------------------------------------------
-    with torch.no_grad():
-        for p, tp in zip(q_net.parameters(), q_net_target.parameters()):
-            tp.data.mul_(0.995).add_(0.005 * p.data)
-        for p, tp in zip(v_net.parameters(), v_net_target.parameters()):
-            tp.data.mul_(0.995).add_(0.005 * p.data)
-
-    # -------- logging -------------------------------------------------------
-    if step % 500 == 0 and wandb.run:
-        wandb.log({
-            "loss/q": loss_q.item(),
-            "loss/v": loss_v.item(),
-            "expectile_gap": expect_gap.item(),
-            "v_mean": v_mean.item(),
-            "q_sel_mean": q_mean.item(),
-            "q_max": q_sel.max().item(),
-            "v_max": v_pred.max().item()
-        }, step=step)
-
-    return expect_gap.item()          # для адаптивного τ в основной петле
 
 # ---------- Policy Execution ----------
 def policy_execute(
@@ -379,7 +348,7 @@ def policy_execute(
 
 # ---------- Prioritized Replay Buffer ----------
 class PrioritizedReplayBuffer:
-    def __init__(self, capacity, state_dim, action_dim, device, alpha=0.6, beta_start=0.3, beta_frames=100000):
+    def __init__(self, capacity, state_dim, action_dim, latent_dim, device, alpha=0.6, beta_start=0.3, beta_frames=100000):
         self.capacity = capacity
         self.device = device
         self.alpha = alpha
@@ -394,13 +363,15 @@ class PrioritizedReplayBuffer:
         self.actions = torch.zeros((capacity, action_dim), device=device)
         self.rewards = torch.zeros((capacity,), device=device)
         self.next_states = torch.zeros((capacity, state_dim), device=device)
+        self.latents = torch.zeros((capacity, latent_dim), device=device) 
         self.priorities = torch.ones((capacity,), device=device)
 
-    def add(self, s, a, r, s_next):
+    def add(self, s, a, r, s_next, z):
         self.states[self.ptr] = s
         self.actions[self.ptr] = a
         self.rewards[self.ptr] = r
         self.next_states[self.ptr] = s_next
+        self.latents[self.ptr] = z
         self.priorities[self.ptr] = self.priorities.max() if self.size > 0 else 1.0
 
         self.ptr = (self.ptr + 1) % self.capacity
@@ -419,7 +390,7 @@ class PrioritizedReplayBuffer:
         beta = min(beta, 1.0)
         self.frame += 1
 
-        weights = (self.size * probs[indices]) ** (-beta)
+        weights = (self.capacity * probs[indices]) ** (-beta)
         weights /= weights.max()
 
         return {
@@ -427,202 +398,306 @@ class PrioritizedReplayBuffer:
             'action': self.actions[indices],
             'reward': self.rewards[indices],
             'next_state': self.next_states[indices],
+            'latent': self.latents[indices],
             'weights': weights.unsqueeze(1).to(self.device),
-            'indices': indices
+            'indices': indices,
         }
 
     def update_priorities(self, indices, priorities):
         self.priorities[indices] = priorities
 
-# === Beta-VAE and Diffusion Training ===
+# === phase-1: β-VAE  +  Transformer-prior ================================
 def train_beta_vae(
-    env,
-    dataset,
+    dataset: dict,
+    valid: np.ndarray,                  # 1-D bool mask длиной (len(obs)-H)
     beta_vae: BetaVAE,
-    diffusion_model: LatentDiffusionUNet,
-    diffusion_prior_steps: int = 200,
+    diff_prior: TransformerPrior,
+    *,
+    horizon: int = 30,
+    steps: int = 200,                   # diffusion-prior steps
     device: str = "cuda",
     epochs: int = 100,
+    batch_size: int = 128,
+    lr: float = 5e-5,
     save_every: int = 10,
-    save_dir: str = "output",
+    save_dir: str = "output/vae",
 ):
-    # wandb.watch(beta_vae)
+    """Совместное обучение β-VAE (θ) и TransformerPrior (ψ)."""
+    os.makedirs(save_dir, exist_ok=True)
 
-    H = 30
-    obs = torch.tensor(dataset["observations"], dtype=torch.float32)
-    acts = torch.tensor(dataset["actions"], dtype=torch.float32)
-    N = len(obs) - H
-    sequences = [(obs[i:i+H], acts[i:i+H]) for i in range(N)]
+    # --- тензоры на нужном девайсе ----------------------------------------
+    obs  = torch.tensor(dataset["observations"], dtype=torch.float32,
+                        device=device)
+    acts = torch.tensor(dataset["actions"],      dtype=torch.float32,
+                        device=device)
 
-    optimizer = torch.optim.Adam(beta_vae.parameters(), lr=5e-5)
-    batch_size = 128
+    start_idx = torch.nonzero(torch.tensor(valid), as_tuple=False).squeeze(1)
+    N = len(start_idx)
 
-    for epoch in trange(epochs, desc="BetaVAE Training"):
-        random.shuffle(sequences)
+    opt = torch.optim.Adam(
+        list(beta_vae.parameters()) + list(diff_prior.parameters()),
+        lr=lr)
+
+    for epoch in trange(epochs, desc="β-VAE training"):
+        # случайная перестановка валидных индексов
+        perm = start_idx[torch.randperm(N, device=device)]
         losses = []
 
         for i in range(0, N, batch_size):
-            batch = sequences[i:i+batch_size]
-            s_seq = torch.stack([item[0] for item in batch]).to(device)  # (B, H, s_dim)
-            a_seq = torch.stack([item[1] for item in batch]).to(device)  # (B, H, a_dim)
-            loss = beta_vae.elbo_loss(s_seq, a_seq, diffusion_model=diffusion_model, beta=0.1, steps=diffusion_prior_steps)
-            optimizer.zero_grad()
+            idx = perm[i : i + batch_size]           # (B,)
+            # --- формируем батч длиной horizon ---------------------------
+            s_seq = torch.stack([obs [j : j + horizon] for j in idx])
+            a_seq = torch.stack([acts[j : j + horizon] for j in idx])
+
+            loss = beta_vae.elbo_loss(
+                s_seq, a_seq,
+                diff_prior = diff_prior,
+                beta       = 0.1,
+                steps      = steps)
+
+            opt.zero_grad()
             loss.backward()
-            optimizer.step()
+            torch.nn.utils.clip_grad_norm_(beta_vae.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(diff_prior.parameters(), 1.0)
+            opt.step()
             losses.append(loss.item())
 
-        avg_loss = sum(losses) / len(losses)
-        wandb.log({"beta_vae/elbo_loss": avg_loss}, step=epoch)
+        wandb.log({"beta_vae/elbo": np.mean(losses)}, step=epoch)
 
         if epoch % save_every == 0 or epoch == epochs - 1:
-            torch.save(beta_vae.state_dict(), f"{save_dir}/vae/beta_vae_epoch{epoch}.pt")
+            torch.save(beta_vae.state_dict(),
+                       f"{save_dir}/beta_vae_epoch{epoch}.pt")
+            torch.save(diff_prior.state_dict(),
+                       f"{save_dir}/diff_prior_epoch{epoch}.pt")
+
 
 def train_diffusion_model(
-    dataset,
-    beta_vae: BetaVAE,
-    diffusion_model: LatentDiffusionUNet,
-    device="cuda",
+    dataset: dict,
+    valid: np.ndarray,                       # маска «хвост H не пересекает done»
+    beta_vae: BetaVAE,                       # уже обученный, .eval() & frozen
+    diffusion_model: LatentDiffusionUNet,    # U-Net (ψ)
+    *,
+    horizon: int = 30,
+    steps:   int = 500,                      # diffusion T
+    gamma_snr: float = 5.0,
+    device: str = "cuda",
     epochs: int = 450,
+    batch_size: int = 128,
+    lr: float = 1e-4,
     save_every: int = 50,
-    save_dir: str = "output",
+    save_dir: str = "output/diffusion",
 ):
-    H = 30                                   # горизонт навыка (Maze2D)
-    obs = torch.tensor(dataset["observations"], dtype=torch.float32, device=device)
-    acts = torch.tensor(dataset["actions"],      dtype=torch.float32, device=device)
-    N   = len(obs) - H                          # кол-во стартовых индексов
+    os.makedirs(save_dir, exist_ok=True)
 
-    optimizer = torch.optim.Adam(diffusion_model.parameters(), lr=1e-4)
-    batch_size = 128
+    obs  = torch.tensor(dataset["observations"], dtype=torch.float32,
+                        device=device)
+    acts = torch.tensor(dataset["actions"],      dtype=torch.float32,
+                        device=device)
 
-    for epoch in trange(epochs, desc="Diffusion Training"):
-        idx_perm = torch.randperm(N, device=device)
-        losses   = []
+    start_idx = torch.nonzero(torch.tensor(valid), as_tuple=False).squeeze(1)
+    N = len(start_idx)
+
+    opt = torch.optim.Adam(diffusion_model.parameters(), lr=lr)
+
+    # ------- pre-compute variance schedule ---------------------------------
+    beta_sched  = torch.linspace(1e-4, 0.02, steps, device=device)  # βₜ
+    alpha       = 1.0 - beta_sched
+    alpha_bar   = torch.cumprod(alpha, dim=0)                       # ᾱₜ
+
+    for epoch in trange(epochs, desc="Latent-Diffusion"):
+        perm = start_idx[torch.randperm(N, device=device)]
+        losses = []
 
         for i in range(0, N, batch_size):
-            idx = idx_perm[i : i + batch_size]          # стартовые позиции (B,)
-            # -------- формируем последовательности длиной H ----------------
-            s_seq = torch.stack([obs[j : j + H] for j in idx])   # (B, H, s_dim)
-            a_seq = torch.stack([acts[j : j + H] for j in idx])  # (B, H, a_dim)
-            s0    = s_seq[:, 0]                                   # текущий state (B, s_dim)
+            idx = perm[i : i + batch_size]
+            s_seq = torch.stack([obs [j : j + horizon] for j in idx])
+            a_seq = torch.stack([acts[j : j + horizon] for j in idx])
+            s0    = s_seq[:, 0]
 
             with torch.no_grad():
-                z, _, _ = beta_vae.encode(s_seq, a_seq)          # (B, latent)
+                z, _, _ = beta_vae.encode(s_seq, a_seq)            # (B, L)
 
-            # -------- добавляем шум ----------------------------------------
-            steps = 500
-            t = torch.randint(1, steps + 1, (z.size(0),), device=device)
-            noise = torch.randn_like(z)
-            z_t   = z + noise * 0.1                              # простой гаусс-ноиз
+            # --------- sample j and noised latent -------------------------
+            j = torch.randint(1, steps + 1, (z.size(0),), device=device)
+            a_bar_j = alpha_bar[j - 1].unsqueeze(1)                # (B,1)
+            eps  = torch.randn_like(z)
+            z_j  = (a_bar_j.sqrt() * z +
+                    (1 - a_bar_j).sqrt() * eps)
 
-            pred = diffusion_model(z_t, s0, t)                  # предсказываем z_0
-            loss = F.mse_loss(pred, z)
+            # --------- predict, weigh by Min-SNR --------------------------
+            z0_pred = diffusion_model(z_j, s0, j)                  # (B, L)
+            snr = a_bar_j / (1 - a_bar_j)                          # (B,1)
+            weight = torch.minimum(snr, torch.tensor(gamma_snr, device=device))
+            loss = (weight * (z0_pred - z).pow(2)).sum(-1).mean()  # scalar
 
-            optimizer.zero_grad()
+            opt.zero_grad()
             loss.backward()
-            optimizer.step()
+            torch.nn.utils.clip_grad_norm_(diffusion_model.parameters(), 1.0)
+            opt.step()
             losses.append(loss.item())
 
-        avg_loss = sum(losses) / len(losses)
-        if wandb and wandb.run:
-            wandb.log({"diffusion/loss": avg_loss}, step=epoch)
+        wandb.log({"diffusion/loss": np.mean(losses)}, step=epoch)
 
         if epoch % save_every == 0 or epoch == epochs - 1:
-            os.makedirs(f"{save_dir}/diffusion", exist_ok=True)
             torch.save(diffusion_model.state_dict(),
-                       f"{save_dir}/diffusion/diffusion_model_epoch{epoch}.pt")
+                       f"{save_dir}/ldm_epoch{epoch}.pt")
 
 
-def adaptive_tau(gap, hi=0.9, lo=0.7, lo2=0.6, up_thresh=1.0, low_thresh=-0.5):
-    if gap > up_thresh:
-        return lo2       # V сильно ниже Q — делаем τ≈0.6
-    return lo  if gap < low_thresh else hi
+# ---------------------------------------------------------------------
+#   DIAR · шаг 3  –  Q- / V-обучение  (Maze2D horizon = 30)
+# ---------------------------------------------------------------------
+def build_replay_buffer(dataset, valid_mask, horizon,
+                        beta_vae, state_dim, action_dim, latent_dim, device):
+    cap = int(valid_mask.sum())
+    rb = PrioritizedReplayBuffer(cap, state_dim, action_dim,
+                                 latent_dim, device,
+                                 alpha=0.7, beta_start=0.3,
+                                 beta_frames=100_000)
 
-# -----------------------------------------------------------
-# MAIN TRAINING LOOP
-# -----------------------------------------------------------
+    γ = 0.995
+    obs, acts, rews, nexto = (dataset[k] for k in
+                              ("observations","actions","rewards","next_observations"))
+
+    idx_all = torch.nonzero(valid_mask, as_tuple=False).squeeze(1)
+    for i in idx_all.cpu():
+        # -------- траектория длиной H -----------------------------------
+        s_seq = torch.tensor(obs [i : i+horizon], device=device, dtype=torch.float32)
+        a_seq = torch.tensor(acts[i : i+horizon], device=device, dtype=torch.float32)
+        s0    = s_seq[0]
+        a0    = a_seq[0]
+        s_H   = torch.tensor(nexto[i + horizon], device=device, dtype=torch.float32)
+
+        # -------- γ-суммированная награда --------------------------------
+        R = sum((γ ** j) * float(rews[i + j]) for j in range(horizon))
+        R = torch.tensor(R, dtype=torch.float32, device=device)
+
+        # -------- латент zₜ ---------------------------------------------
+        with torch.no_grad():
+            z, _, _ = beta_vae.encode(s_seq.unsqueeze(0), a_seq.unsqueeze(0))
+            z = z.squeeze(0)                               # (latent_dim,)
+
+        rb.add(s0, a0, R, s_H, z)          # ← добавляем z
+    return rb
+# ---------------------------------------------------------------------
+
 def train_diar(
-    env, dataset,
+    env, dataset, valid_mask,
     state_dim, action_dim,
-    latent_dim=16,
-    beta_vae=None, diffusion_model=None,
-    num_steps=100_000,
-    device="cuda",
-    save_every=10_000,
-    save_dir="output",
+    latent_dim       = 16,
+    beta_vae         = None,
+    diffusion_model  = None,
+    num_steps        = 100_000,
+    horizon          = 30,
+    device           = "cuda",
+    save_every       = 10_000,
+    save_dir         = "output/diar",
 ):
-    # ---------- replay buffer preload --------------------------------------
-    horizon = 30
-    rb_size = len(dataset['observations']) - horizon
-    replay_buffer = PrioritizedReplayBuffer(
-        capacity=rb_size, state_dim=state_dim, action_dim=action_dim,
-        device=device, alpha=0.6, beta_start=0.3, beta_frames=num_steps)
+    os.makedirs(save_dir, exist_ok=True)
 
-    print(f"Preloading {rb_size} transitions ...")
-    for i in trange(rb_size):
-        s  = torch.tensor(dataset['observations'][i]      , device=device)
-        a  = torch.tensor(dataset['actions'][i]           , device=device)
-        r  = sum((0.995**j) * dataset['rewards'][i+j] for j in range(horizon))
-        sn = torch.tensor(dataset['next_observations'][i+horizon], device=device)
-        replay_buffer.add(s, a, r, sn)
+    # -------- модели ------------------------------------------------------
+    beta_vae = beta_vae or BetaVAE(state_dim, action_dim, latent_dim).to(device).eval()
+    diffusion_mod = diffusion_model or LatentDiffusionUNet(
+                        latent_dim, state_dim).to(device).eval()
 
-    # ---------- models ------------------------------------------------------
-    beta_vae       = beta_vae or BetaVAE(state_dim, action_dim, latent_dim).to(device)
-    diffusion_model= diffusion_model or LatentDiffusionUNet(latent_dim, state_dim).to(device)
-    q_net, v_net   = DoubleQNet(state_dim, latent_dim).to(device), ValueNet(state_dim).to(device)
-    q_tgt, v_tgt   = DoubleQNet(state_dim, latent_dim).to(device), ValueNet(state_dim).to(device)
+    q_net   = DoubleQNet(state_dim, latent_dim).to(device)
+    v_net   = ValueNet(state_dim).to(device)
+    q_tgt   = DoubleQNet(state_dim, latent_dim).to(device)
+    v_tgt   = ValueNet(state_dim).to(device)
     q_tgt.load_state_dict(q_net.state_dict())
     v_tgt.load_state_dict(v_net.state_dict())
 
-    optimizer_q = torch.optim.Adam(q_net.parameters(), lr=5e-4)
-    optimizer_v = torch.optim.Adam(v_net.parameters(), lr=1e-4, weight_decay=1e-4)
+    opt_q = torch.optim.Adam(q_net.parameters(), lr=5e-4)  # табл. 6
+    opt_v = torch.optim.Adam(v_net.parameters(), lr=1e-4, weight_decay=1e-4)
 
-    # ---------- scheduler: 25 эпох -----------------------------------------
-    batch_size   = 128
-    steps_per_ep = max(1, rb_size // batch_size)
-    step_size_lr = 25 * steps_per_ep       # ~25 эпох
-    # print(step_size_lr)
-    # exit()
-    step_size_lr = 50000
-    scheduler_v  = torch.optim.lr_scheduler.StepLR(
-        optimizer_v, step_size=step_size_lr, gamma=0.3)
+    # -------- реплэй-буфер -----------------------------------------------
+    rb = build_replay_buffer(
+        dataset      = dataset,
+        valid_mask   = valid_mask,
+        horizon      = horizon,
+        beta_vae     = beta_vae,
+        state_dim    = state_dim,
+        action_dim   = action_dim,
+        latent_dim   = latent_dim,
+        device       = device)
 
-    # ---------- loop --------------------------------------------------------
-    expect_gap_prev = 0.0
-    pbar = trange(num_steps, desc="DIAR Training")
+    # ---- StepLR на V-сеть: шаг = 50 итераций  ----------------------------
+    sched_v = torch.optim.lr_scheduler.StepLR(opt_v, step_size=50, gamma=0.3)
+
+    τ = 0.9                    # фиксированный expectile  (табл. 6)
+    γ = 0.995                  # discount
+
+    pbar = trange(num_steps, desc="DIAR-Q/V")
     for step in pbar:
-        tau_now = adaptive_tau(expect_gap_prev)     # 0.95 / 0.5
+        # ------------------------- Q-update ------------------------------
+        batch = rb.sample(128)
+        s  = batch['state']
+        z   = batch['latent']                  # ← готовый zₜ
+        r  = batch['reward'].unsqueeze(1)          # (B,1)
+        sn = batch['next_state']
+        w  = batch['weights']
+        idx= batch['indices']
 
-        expect_gap_prev = train_diar_step(
-            replay_buffer,
-            q_net, v_net,
-            q_tgt, v_tgt,
-            diffusion_model, beta_vae,
-            optimizer_q, optimizer_v,
-            tau_now,
-            gamma=0.995,
-            latent_dim=latent_dim,
-            ddpm_steps=10,
-            device=device,
-            step=step)
+        #  latent из β-VAE
+        with torch.no_grad():
+            v_target = v_tgt(sn)
+            q_tar    = r + γ * v_target
 
-        scheduler_v.step()                          # LR-sheduler для V
+        q1, q2 = q_net(s, z)
+        q_pred = torch.min(q1, q2)
 
-        # ---- периодическая оценка -----------------------------------------
+        td = (q_tar - q_pred).detach()
+        loss_q = (w * td.pow(2)).mean()
+
+        opt_q.zero_grad()
+        loss_q.backward()
+        opt_q.step()
+
+        rb.update_priorities(idx, td.abs() + 1e-6)
+
+        # ------------------------- V-update ------------------------------
+        with torch.no_grad():
+            # 500 DDPM-латентов
+            z_ddpm = torch.stack(
+                [ddpm_sample(diffusion_mod, s, latent_dim, steps=10)   # (B,L)
+                for _ in range(500)], dim=0).permute(1,0,2)           # → (B,500,L)
+
+            # 32 латента из β-VAE
+            z_data = z.unsqueeze(1).expand(-1, 32, -1)                # (B,32,L)
+
+        loss_v = compute_v_loss(
+            q_tgt, v_net, s,
+            z_ddpm, z_data,
+            k=100, tau=τ, lambda_v=0.5)
+
+        opt_v.zero_grad()
+        loss_v.backward()
+        torch.nn.utils.clip_grad_norm_(v_net.parameters(), 1.0)
+        opt_v.step()
+        sched_v.step()
+
+        # ------------------------- target soft-update --------------------
+        with torch.no_grad():
+            for p, tp in zip(q_net.parameters(), q_tgt.parameters()):
+                tp.data.mul_(0.995).add_(0.005 * p.data)
+            for p, tp in zip(v_net.parameters(), v_tgt.parameters()):
+                tp.data.mul_(0.995).add_(0.005 * p.data)
+
+        # ------------------ периодическая проверка -----------------------
         if step % 500 == 0:
-            rew = policy_execute(env, q_net, v_net,
-                                 beta_vae, diffusion_model,
-                                 device=device)
-            wandb.log({"eval/reward": rew, "lr_v": scheduler_v.get_last_lr()[0]}, step=step)
-            pbar.set_postfix({"eval_reward": rew})
+            rew = policy_execute(
+                env, q_net, v_net, beta_vae, diffusion_mod,
+                device=device)
+            wandb.log({"eval/reward": rew,
+                       "loss/q": loss_q.item(),
+                       "loss/v": loss_v.item()}, step=step)
+            pbar.set_postfix({"rew": rew})
 
-        # ---- чекпоинты -----------------------------------------------------
+        # --------------- чекпоинт ---------------------------------------
         if step % save_every == 0 or step == num_steps - 1:
-            torch.save(q_net.state_dict()      , f"{save_dir}/diar/q_net_step{step}.pt")
-            torch.save(v_net.state_dict()      , f"{save_dir}/diar/v_net_step{step}.pt")
-            torch.save(beta_vae.state_dict()   , f"{save_dir}/diar/beta_vae_step{step}.pt")
-            torch.save(diffusion_model.state_dict(),
-                       f"{save_dir}/diar/diffusion_model_step{step}.pt")
-
+            torch.save(q_net.state_dict(),
+                       f"{save_dir}/q_net_{step}.pt")
+            torch.save(v_net.state_dict(),
+                       f"{save_dir}/v_net_{step}.pt")
 
 
 def load_latest_checkpoint(model, name, folder="output"):
@@ -636,54 +711,100 @@ def load_latest_checkpoint(model, name, folder="output"):
     return model
 
 
-if __name__ == "__main__":
+def build_next_obs(dset, horizon):
+    """Создаём dset["next_observations"], не переходя границы эпизода."""
+    obs = dset["observations"]
+    terms = dset["terminals"].astype(bool) | dset["timeouts"].astype(bool)
+    next_obs = np.empty_like(obs)
+    next_obs[:-1] = obs[1:]
+    next_obs[-1]  = obs[-1]                         # dummy в конце
+
+    # обнуляем переходы через done
+    next_obs[terms] = obs[terms]
+
+    dset["next_observations"] = next_obs
+
+    # флаг — какие индексы ещё имеют H-шаговый «хвост» в том же эпизоде
+    valid_mask = np.ones(len(obs) - horizon, dtype=bool)
+    for i in range(len(valid_mask)):
+        if terms[i : i + horizon].any():
+            valid_mask[i] = False
+    return valid_mask
+
+# ---------------------------------------------------------------------------
+
+def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--env", type=str, default="maze2d-umaze-v1")
-    parser.add_argument("--device", type=str, default="cuda")
-    parser.add_argument("--save_dir", type=str, default="output")
+    parser.add_argument("--env",        default="maze2d-umaze-v1")
+    parser.add_argument("--device",     default="cuda")
+    parser.add_argument("--save_dir",   default="output")
+    parser.add_argument("--latent_dim", default=16, type=int)
+    parser.add_argument("--horizon",    default=30, type=int)
     args = parser.parse_args()
 
-    wandb.init(project="diar", name="diar_run")
+    wandb.init(project="diar", name=f"diar_{args.env}")
 
-    os.makedirs(args.save_dir, exist_ok=True)
-    os.makedirs(args.save_dir + "/vae", exist_ok=True)
-    os.makedirs(args.save_dir + "/diffusion", exist_ok=True)
-    os.makedirs(args.save_dir + "/diar", exist_ok=True)
+    # --------- папки --------------------------------------------------------
+    for sub in ("vae", "diffusion", "diar"):
+        os.makedirs(os.path.join(args.save_dir, sub), exist_ok=True)
 
+    # --------- данные -------------------------------------------------------
     env = gym.make(args.env)
-    dataset = env.get_dataset()
-    if "next_observations" not in dataset:
-        print("Generating next_observations from observations...")
-        dataset["next_observations"] = dataset["observations"][1:]
-        dataset["observations"] = dataset["observations"][:-1]
-        dataset["actions"] = dataset["actions"][:-1]
-        dataset["rewards"] = dataset["rewards"][:-1]
-        if "terminals" in dataset:
-            dataset["terminals"] = dataset["terminals"][:-1]
-        if "timeouts" in dataset:
-            dataset["timeouts"] = dataset["timeouts"][:-1]
+    dset = env.get_dataset()
+    if "next_observations" not in dset:
+        print("→ генерируем next_observations ...")
+        valid_mask = build_next_obs(dset, args.horizon)
+    else:
+        valid_mask = np.ones(len(dset["observations"]) - args.horizon, bool)
 
-    state_dim = dataset["observations"].shape[1]
-    action_dim = dataset["actions"].shape[1]
-    latent_dim = 16
+    state_dim  = dset["observations"].shape[1]
+    action_dim = dset["actions"].shape[1]
 
-    beta_vae = BetaVAE(state_dim, action_dim, latent_dim).to(args.device)
-    diffusion_model = LatentDiffusionUNet(latent_dim, state_dim).to(args.device)
+    # --------- модели -------------------------------------------------------
+    beta_vae   = BetaVAE(state_dim, action_dim, args.latent_dim).to(args.device)
+    t_prior    = TransformerPrior(args.latent_dim, state_dim).to(args.device)
+    ldm_unet   = LatentDiffusionUNet(args.latent_dim, state_dim).to(args.device)
 
-    print("=== Training Beta-VAE ===")
-    train_beta_vae(env, dataset, beta_vae, diffusion_model, device=args.device, epochs=100, save_dir=args.save_dir)
+    # -------------------- (1) β-VAE + Transformer prior --------------------
+    train_beta_vae(
+        env      = env,
+        dataset  = dset,
+        valid    = valid_mask,
+        beta_vae = beta_vae,
+        diff_prior = t_prior,
+        device   = args.device,
+        epochs   = 100,
+        save_dir = os.path.join(args.save_dir, "vae"))
 
-    # beta_vae = load_latest_checkpoint(beta_vae, "beta_vae", folder=args.save_dir + "/vae")
+    # замораживаем
+    beta_vae.eval()
+    for p in beta_vae.parameters(): p.requires_grad = False
+    t_prior.eval()
+    for p in t_prior.parameters(): p.requires_grad = False
 
-    print("=== Training Diffusion Model ===")
-    train_diffusion_model(dataset, beta_vae, diffusion_model, device=args.device, epochs=450, save_dir=args.save_dir)
+    # -------------------- (2) Latent diffusion U-Net -----------------------
+    train_diffusion_model(
+        dataset  = dset,
+        valid    = valid_mask,
+        beta_vae = beta_vae,
+        diffusion_model = ldm_unet,
+        device   = args.device,
+        epochs   = 450,
+        save_dir = os.path.join(args.save_dir, "diffusion"))
 
-    # beta_vae.eval()
-    # for p in beta_vae.parameters():
-    #     p.requires_grad = False
-    # diffusion_model = load_latest_checkpoint(diffusion_model, "diffusion_model", folder=args.save_dir + "/diffusion")
+    # -------------------- (3) DIAR Q / V training --------------------------
+    train_diar(
+        env        = env,
+        dataset    = dset,
+        valid_mask = valid_mask,
+        state_dim  = state_dim,
+        action_dim = action_dim,
+        latent_dim = args.latent_dim,
+        beta_vae   = beta_vae,
+        diffusion_model = ldm_unet,
+        num_steps  = 100_000,
+        device     = args.device,
+        save_dir   = os.path.join(args.save_dir, "diar"))
 
-    # print("=== Starting DIAR Training ===")
-    # train_diar(env=env, dataset=dataset, state_dim=state_dim, action_dim=action_dim,
-    #            latent_dim=latent_dim, beta_vae=beta_vae, diffusion_model=diffusion_model,
-    #            num_steps=100000, device=args.device, save_dir=args.save_dir)
+if __name__ == "__main__":
+    main()
