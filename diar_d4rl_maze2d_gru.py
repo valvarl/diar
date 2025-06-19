@@ -218,15 +218,28 @@ class LatentDiffusionUNet(nn.Module):
 
 # DDPM sample (T=500 by default)
 
-def ddpm_sample(model, s, latent_dim, steps=500):
-    z = torch.randn(s.size(0), latent_dim, device=s.device)
-    beta = 1.0 / steps
+# --------------------------------------------------------------
+# DDPM-инференс через обученный U-Net (используется после тренировки LDM)
+# --------------------------------------------------------------
+def ddpm_sample(model: nn.Module,               # обученный LatentDiffusionUNet
+                s: torch.Tensor,                # (B , state_dim)
+                latent_dim: int,
+                steps: int = 500,               # T из табл. 5
+                beta_max: float = 0.02):
+    """
+    DDPM-инференс c линейным β_t = t/T·β_max (§A.2, Algo 4, Tab 5)
+    """
+    B, device = s.size(0), s.device
+    z = torch.randn(B, latent_dim, device=device)
+
+    t_arr = torch.arange(steps, 0, -1, device=device)        # T…1
+    beta  = (t_arr / steps) * beta_max                       # (T,)
     alpha = 1.0 - beta
-    for t in reversed(range(1, steps + 1)):
-        tt = torch.full((s.size(0),), t, device=s.device)
-        z0 = model(z, s, tt)
-        z = alpha * z0 + (1 - alpha) * z + torch.randn_like(z) * math.sqrt(beta)
-    return z
+    for t_idx, bt, at in zip(t_arr, beta, alpha):
+        tt = torch.full((B,), int(t_idx), device=device)
+        z0 = model(z, s, tt)                                 # предсказанный z_0
+        z  = at * z0 + (1 - at) * z + torch.randn_like(z) * bt.sqrt()
+    return z                                                 # (B, latent_dim)
 
 # ---------------------------------------------------------------------------
 # Q‑network / V‑network (as in Appendix A.3)
@@ -270,81 +283,102 @@ class ValueNet(nn.Module):
         return self.v(self.enc(s)).squeeze(-1)
 
 # ---------- Losses ----------
-def compute_v_loss(q_net_t, v_net, s,
-                   z_ddpm, z_data,
-                   k=100, tau=0.9, lambda_v=0.5,  # λ_v = 0.5 как в цикле
-                   return_stats=False):
+def compute_v_loss(
+    q_net_t,
+    v_net,
+    s: torch.Tensor,              # (B, state_dim)
+    z_ddpm: torch.Tensor,        # (B, 500, L)
+    z_data: torch.Tensor,        # (B, 32,  L)
+    *,
+    k: int        = 100,
+    tau: float    = 0.9,
+    lambda_v: float = 0.5,
+    return_stats: bool = False,
+):
     """
-    z_ddpm : (B, n_d, latent)   – латенты генератора
-    z_data : (B, n_g, latent)   – латенты из датасета β-VAE.encode
+    L_V  из Eq.(6): expectile-loss между top-k Q-значениями и V(s).
     """
     B = s.size(0)
-
-    # ---- объединяем -------------------------------------------------------
-    z_all = torch.cat([z_ddpm, z_data], dim=1)          # (B, n_d+n_g, latent)
+    z_all = torch.cat([z_ddpm, z_data], dim=1)         # (B, 532, L)
     n_all = z_all.size(1)
 
     with torch.no_grad():
-        s_exp = s.unsqueeze(1).expand(-1, n_all, -1)
+        s_rep = s.unsqueeze(1).expand(-1, n_all, -1)   # (B,n_all, state_dim)
         q1, q2 = q_net_t(
-            s_exp.reshape(-1, s.shape[-1]),
+            s_rep.reshape(-1, s.shape[-1]),
             z_all.reshape(-1, z_all.shape[-1]))
-        q_vals = torch.min(q1, q2).view(B, n_all)       # (B, n_all)
+        q_vals = torch.min(q1, q2).view(B, n_all)      # (B,n_all)
+        q_sel  = torch.topk(q_vals, k=min(k, n_all), dim=1).values  # (B,k)
 
-        # ---- top-k фильтр -------------------------------------------------
-        topk_q, idx = torch.topk(q_vals, k=min(k, n_all), dim=1)
-        q_sel  = topk_q                                   # (B, k)
-
-    v_pred = v_net(s).unsqueeze(1)                    # (B,1)
-    u      = q_sel - v_pred                           # (B,k)
-    w      = torch.where(u > 0, tau, 1 - tau)
-    loss   = lambda_v * (w * u.pow(2)).mean()
+    v_pred = v_net(s).unsqueeze(1)                     # (B,1)
+    u  = q_sel - v_pred                                # (B,k)
+    w  = torch.where(u > 0, tau, 1 - tau)
+    loss = lambda_v * (w * u.pow(2)).mean()
 
     if return_stats:
         gap      = (q_sel.mean(dim=1) - v_pred.squeeze(1)).mean().detach()
         v_mean   = v_pred.mean().detach()
         q_mean   = q_sel.mean().detach()
-        return loss, gap, v_mean, q_mean, v_pred.detach(), q_sel.detach()
+        v_pred   = v_pred.detach()
+        q_sel    = q_sel.detach()
+        return loss, gap, v_mean, q_mean, v_pred, q_sel
     return loss
 
 
 # ---------- Policy Execution ----------
 def policy_execute(
     env,
-    q_net,
-    v_net,
-    beta_vae,
-    diffusion_model,
-    steps=30,
-    latent_dim=16,
-    ddpm_steps=10,
-    revaluation_attempts=5,
-    device="cpu"
+    q_net, v_net,
+    beta_vae, diffusion_model,
+    horizon: int          = 30,
+    latent_dim: int       = 16,
+    ddpm_steps: int       = 10,      # “extra steps = 5” => horizon/ddpm_steps
+    n_latents: int        = 500,     # Tab 6 “# latent samples 500”
+    reval_attempts: int   = 5,       # Tab 6 “extra steps 5”
+    device: str           = "cpu"
 ):
-    state = env.reset()
-    done = False
-    total_reward = 0
-    t = 0
+    s_np, done = env.reset(), False
+    total_r, t_total = 0.0, 0
 
-    while not done and t < steps:
-        s = torch.tensor(state, dtype=torch.float32, device=device).unsqueeze(0)
-        for _ in range(revaluation_attempts):
-            z = ddpm_sample(diffusion_model, s, latent_dim, ddpm_steps)
-            a = beta_vae.decode_action(s, z)
-            s_pred = beta_vae.decode_state(s, z)
+    while not done:
+        # ---- (строки 5–8) · сэмпл n латентов и argmax Q ----------------
+        s = torch.tensor(s_np, dtype=torch.float32,
+                         device=device).unsqueeze(0)         # (1, state_dim)
 
-            if v_net(s) > v_net(s_pred):     # пересэмплировать, если текущее лучше
-                continue                     # вместо break
-            else:
+        with torch.no_grad():
+            z_pool = torch.stack(
+                [ddpm_sample(diffusion_model, s, latent_dim, ddpm_steps)
+                 for _ in range(n_latents)], dim=1)           # (1,n,L)
+            
+            q1, q2 = q_net(s.repeat(n_latents, 1),
+                            z_pool.squeeze(0))                # (n,)
+            best   = torch.min(q1, q2).argmax()
+            z_star = z_pool[:, best]                          # (1,L)
+
+        # ---- decode H-length skill -------------------------------------
+        for _ in range(horizon):
+            a = beta_vae.decode_action(s, z_star)             # (1, a_dim)
+            s_pred = beta_vae.decode_state(s, z_star)         # (1, s_dim)
+
+            # ---- (строки 11–19) Adaptive Revaluation ------------------
+            with torch.no_grad():
+                if v_net(s) > v_net(s_pred):
+                    # пересэмплируем; выйдем во внешний while
+                    break
+
+            # ---- execute action ---------------------------------------
+            a_np = a.squeeze(0).cpu().numpy()
+            s_np, r, done, _ = env.step(a_np)
+            total_r  += r
+            t_total  += 1
+            if done:
                 break
+            s = torch.tensor(s_np, dtype=torch.float32,
+                             device=device).unsqueeze(0)
 
-        a_np = a.squeeze(0).detach().cpu().numpy()
-        next_state, reward, done, info = env.step(a_np)
-        state = next_state
-        total_reward += reward
-        t += 1
-
-    return total_reward
+        if t_total >= horizon * reval_attempts:   # safety-cap “max T”
+            break
+    return total_r
 
 # ---------- Prioritized Replay Buffer ----------
 class PrioritizedReplayBuffer:
