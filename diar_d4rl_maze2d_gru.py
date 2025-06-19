@@ -318,7 +318,7 @@ def policy_execute(
     steps=30,
     latent_dim=16,
     ddpm_steps=10,
-    revaluation_attempts=3,
+    revaluation_attempts=5,
     device="cpu"
 ):
     state = env.reset()
