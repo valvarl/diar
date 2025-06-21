@@ -1,11 +1,14 @@
+import argparse
+
 import torch
 import gym
 import d4rl
 import numpy as np
-import argparse
-from diar_d4rl_maze2d import (
+from diar_d4rl_maze2d_gru import (
     BetaVAE,
-    LatentDiffusionModel,
+    LatentDiffusionUNet,
+    DoubleQNet,
+    ValueNet,
     ddpm_sample,
     policy_execute,
 )
@@ -19,8 +22,7 @@ def evaluate_diar_policy(env, beta_vae, diffusion_model, q_net=None, v_net=None,
             v_net=v_net,
             beta_vae=beta_vae,
             diffusion_model=diffusion_model,
-            steps=30,
-            revaluation_attempts=3,
+            reval_attempts=5,
             device=device
         )
         rewards.append(reward)
@@ -50,18 +52,29 @@ if __name__ == "__main__":
     beta_vae = BetaVAE(state_dim, action_dim, args.latent_dim).to(args.device)
     beta_vae.load_state_dict(torch.load(args.beta_vae_path))
 
-    diffusion_model = LatentDiffusionModel(args.latent_dim, state_dim).to(args.device)
+    diffusion_model = LatentDiffusionUNet(args.latent_dim, state_dim).to(args.device)
     diffusion_model.load_state_dict(torch.load(args.diffusion_path))
 
     q_net = v_net = None
     if args.q_net_path:
-        from diar_d4rl_maze2d import DoubleQNet
         q_net = DoubleQNet(state_dim, args.latent_dim).to(args.device)
         q_net.load_state_dict(torch.load(args.q_net_path))
 
     if args.v_net_path:
-        from diar_d4rl_maze2d import ValueNet
         v_net = ValueNet(state_dim).to(args.device)
         v_net.load_state_dict(torch.load(args.v_net_path))
+
+    beta_vae.eval()
+    for p in beta_vae.parameters(): 
+        p.requires_grad = False
+    diffusion_model.eval()
+    for p in diffusion_model.parameters(): 
+        p.requires_grad = False
+    q_net.eval()
+    for p in q_net.parameters(): 
+        p.requires_grad = False
+    v_net.eval()
+    for p in v_net.parameters(): 
+        p.requires_grad = False  
 
     evaluate_diar_policy(env, beta_vae, diffusion_model, q_net, v_net, episodes=args.episodes, device=args.device)
