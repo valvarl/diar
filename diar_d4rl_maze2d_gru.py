@@ -25,9 +25,11 @@ random.seed(0)
 # Helper blocks
 # ---------------------------------------------------------------------------
 
-def mlp(in_dim: int,
-        hidden: tuple[int, ...],
-        out_dim: int) -> nn.Sequential:
+def mlp(
+    in_dim: int,
+    hidden: tuple[int, ...],
+    out_dim: int
+) -> nn.Sequential:
     """Helper to build GELU->LayerNorm MLP blocks."""
     layers: list[nn.Module] = []
     dims = (in_dim, *hidden)
@@ -411,36 +413,42 @@ def compute_v_loss(
 # ---------- Policy Execution ----------
 @torch.no_grad()
 def policy_execute(
-    env,
-    q_net:        DoubleQNet,
-    v_net:        ValueNet,
-    beta_vae:     BetaVAE,
-    diffusion:    LatentDiffusionUNet,
+    env:        gym.Env,
+    q_net:      DoubleQNet,
+    v_net:      ValueNet,
+    beta_vae:   BetaVAE,
+    diffusion:  LatentDiffusionUNet,
     *,
-    horizon:        int   = 30,      # H
     latent_dim:     int   = 16,
     ddpm_steps:     int   = 10,      # «extra-steps = 5»  ⇒  H / ddpm_steps
     n_latents:      int   = 500,     # табл. 6
     reval_attempts: int   = 5,       # табл. 6 «extra steps 5»
     value_eps:      float = 0.2,     # допускаем небольшой прогноз-шум
     device:         str   = "cpu",
-    max_actions:    Optional[int] = None,   # safety-cap, если env не выдаёт done
+    max_actions:    Optional[int] = None
 ) -> float:
     """
     Инференс DIAR (Algo 2).
 
     1. Для каждого состояния:
        • генерируем `n_latents` кандидатов батчем через DDPM;
-       • берём `argmax Q(s, z)` (с учётом clipped-double);
+       • берём `argmax Q(s, z)` (c учётом clipped-double);
        • проверяем Adaptive Revaluation:  V(s_pred) ≥ V(s) - ε.
     2. Если условие не выполнено → пересэмплируем (до `reval_attempts` раз).
     3. Выполняем одно действие, повторяем цикл.
     """
+    def augment(state_np: np.ndarray, goal_abs: np.ndarray) -> np.ndarray:
+            """Добавляем относительную цель ⇒ (6,)."""
+            return np.concatenate([state_np, goal_abs - state_np[:2]], axis=0)
+
     # ---------------------------------------------------------------------
-    state_np, done = env.reset(), False
-    total_reward   = 0.0
-    action_count   = 0
-    max_actions    = max_actions or horizon * reval_attempts
+    goal_abs = np.asarray(env.unwrapped._target, dtype=np.float32)
+    state_np = env.reset()
+    state_np = augment(state_np, goal_abs)
+    done = False
+    total_reward = 0.0
+    action_count = 0
+    max_actions = max_actions or env._max_episode_steps
 
     while not done and action_count < max_actions:
         # -------- текущее состояние → tensor -----------------------------
@@ -471,6 +479,7 @@ def policy_execute(
         # -------- выполняем действие ------------------------------------
         action_np   = action_pred.squeeze(0).cpu().detach().numpy()
         state_np, r, done, _ = env.step(action_np)
+        state_np = augment(state_np, goal_abs)
         total_reward += r
         action_count += 1
 
@@ -761,7 +770,7 @@ def build_replay_buffer(dataset, valid_mask, horizon,
                                  alpha=0.7, beta_start=0.3,
                                  beta_frames=100_000)
 
-    γ = 0.995
+    gamma = 0.995
     obs, acts, rews, nexto = (dataset[k] for k in
                               ("observations","actions","rewards","next_observations"))
 
@@ -780,7 +789,7 @@ def build_replay_buffer(dataset, valid_mask, horizon,
         s_H   = torch.tensor(nexto[i + horizon], device=device, dtype=torch.float32)
 
         # -------- γ-суммированная награда --------------------------------
-        R = sum((γ ** j) * float(rews[i + j]) for j in range(horizon))
+        R = sum((gamma ** j) * float(rews[i + j]) for j in range(horizon))
         R = torch.tensor(R, dtype=torch.float32, device=device)
 
         # -------- латент zₜ ---------------------------------------------
@@ -923,6 +932,7 @@ def train_diar(
         if step % 500 == 0:
             rew = policy_execute(env, q_net, v_net,
                                  beta_vae, diffusion_model,
+                                 max_actions=150,  # horizon * reval_attempts
                                  device=device)
             wandb.log({"eval/reward": rew,
                        "loss/q":      loss_q.item(),
@@ -986,6 +996,15 @@ def main():
     # --------- данные -------------------------------------------------------
     env = gym.make(args.env)
     dset = env.get_dataset()
+    obs = dset["observations"]                    # (N,4)
+    goal = dset["infos/goal"]                     # (N,2)
+
+    # вариант B (relative goal)
+    obs_aug = np.concatenate([obs,
+                            goal - obs[:, :2]], axis=1)   # (N,6)
+
+    dset["observations"] = obs_aug
+
     if "next_observations" not in dset:
         print("→ генерируем next_observations ...")
         valid_mask = build_next_obs(dset, args.horizon)
@@ -1047,7 +1066,7 @@ def main():
         state_dim        = state_dim,
         action_dim       = action_dim,
         latent_dim       = args.latent_dim,
-        num_steps        = 200_000,
+        num_steps        = 100_000,
         device     = args.device,
         save_dir   = os.path.join(args.save_dir, "diar"))
 
