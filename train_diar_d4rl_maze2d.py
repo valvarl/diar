@@ -1501,8 +1501,8 @@ def main():
         save_dir    = os.path.join(args.save_dir, "vae")
     )
 
-    beta_vae = load_latest_checkpoint(beta_vae, "beta_vae", os.path.join(args.save_dir, "vae"))
-    t_prior  = load_latest_checkpoint(t_prior,  "diff_prior", os.path.join(args.save_dir, "vae"))
+    #beta_vae = load_latest_checkpoint(beta_vae, "beta_vae", os.path.join(args.save_dir, "vae"))
+    #t_prior  = load_latest_checkpoint(t_prior,  "diff_prior", os.path.join(args.save_dir, "vae"))
 
     # Freeze β-VAE and Transformer prior
     beta_vae.eval()
@@ -1521,7 +1521,7 @@ def main():
         save_dir        = os.path.join(args.save_dir, "diffusion")
     )
     
-    ldm_unet = load_latest_checkpoint(ldm_unet, "ldm", os.path.join(args.save_dir, "diffusion"))
+    #ldm_unet = load_latest_checkpoint(ldm_unet, "ldm", os.path.join(args.save_dir, "diffusion"))
     
     ldm_unet.eval()
     for p in ldm_unet.parameters(): p.requires_grad = False
