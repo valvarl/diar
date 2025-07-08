@@ -29,6 +29,7 @@ from typing import Optional
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.init as init
 import torch.nn.functional as F
 import gym
 import d4rl
@@ -70,13 +71,22 @@ def mlp(
     """
     layers: list[nn.Module] = []
     dims = (in_dim, *hidden)
+
     for i in range(len(hidden)):
+        linear = nn.Linear(dims[i], dims[i + 1])
+        init.kaiming_normal_(linear.weight, nonlinearity='relu')
+        nn.init.zeros_(linear.bias)
         layers += [
-            nn.Linear(dims[i], dims[i + 1]),
+            linear,
             nn.GELU(),
             nn.LayerNorm(dims[i + 1]),
         ]
-    layers.append(nn.Linear(hidden[-1] if hidden else in_dim, out_dim))
+    
+    final = nn.Linear(hidden[-1] if hidden else in_dim, out_dim)
+    init.kaiming_normal_(final.weight, nonlinearity='linear')
+    nn.init.zeros_(final.bias)
+    layers.append(final)
+
     return nn.Sequential(*layers)
 
 # -----------------------------------------------------------------------------
@@ -586,148 +596,282 @@ class ValueNet(nn.Module):
 # [5.1] Value Loss: Expectile Regression from Top-k Q-values (Eq. 6)
 # -----------------------------------------------------------------------------
 
+# def compute_v_loss(
+#     q_net_t,
+#     v_net,
+#     s: torch.Tensor,             # (B, state_dim)
+#     z_ddpm: torch.Tensor,        # (B, 500, latent_dim)
+#     z_data: torch.Tensor,        # (B, 32, latent_dim)
+#     *,
+#     k: int = 100,
+#     tau: float = 0.9,
+#     lambda_v: float = 0.5,
+#     return_stats: bool = False
+# ):
+#     """
+#     Computes the V-loss (Eq. 6 from paper):
+#         L_V = ExpectileLoss(top-k(Q(s, z)) - V(s))
+
+#     Args:
+#         q_net_t     : target Q-network
+#         v_net       : current value network
+#         s           : batch of states, shape (B, state_dim)
+#         z_ddpm      : latents sampled from diffusion model, (B, 500, L)
+#         z_data      : latents from replay buffer, (B, 32, L)
+#         k           : number of top Q-values to use
+#         tau         : expectile (asymmetry coefficient)
+#         lambda_v    : loss scale factor
+#         return_stats: whether to return extra statistics
+
+#     Returns:
+#         loss: scalar loss
+#         [optional stats]: gap, v_mean, q_mean, v_pred, q_sel
+#     """
+#     B = s.size(0)
+#     z_all = torch.cat([z_ddpm, z_data], dim=1)  # (B, 532, L)
+#     n_all = z_all.size(1)
+
+#     with torch.no_grad():
+#         s_rep = s.unsqueeze(1).expand(-1, n_all, -1)  # (B, n_all, state_dim)
+#         q1, q2 = q_net_t(
+#             s_rep.reshape(-1, s.shape[-1]),
+#             z_all.reshape(-1, z_all.shape[-1])
+#         )
+#         q_vals = torch.min(q1, q2).view(B, n_all)  # clipped double Q
+#         q_sel = torch.topk(q_vals, k=min(k, n_all), dim=1).values  # (B, k)
+
+#     v_pred = v_net(s).unsqueeze(1)  # (B, 1)
+#     u = q_sel - v_pred              # (B, k)
+#     w = torch.where(u > 0, tau, 1 - tau)
+#     loss = lambda_v * (w * u.pow(2)).mean()
+    
+#     if return_stats:
+#         gap = (q_sel.mean(dim=1) - v_pred.squeeze(1)).mean().detach()
+#         return loss, gap, v_pred.mean().detach(), q_sel.mean().detach(), v_pred.detach(), q_sel.detach()
+    
+#     return loss
+
+
 def compute_v_loss(
     q_net_t,
     v_net,
-    s: torch.Tensor,             # (B, state_dim)
-    z_ddpm: torch.Tensor,        # (B, 500, latent_dim)
-    z_data: torch.Tensor,        # (B, 32, latent_dim)
+    s: torch.Tensor,              # (B, state_dim)
+    z_ddpm: torch.Tensor,         # (B, n_lat, latent_dim)
     *,
-    k: int = 100,
     tau: float = 0.9,
-    lambda_v: float = 0.5,
-    return_stats: bool = False
 ):
     """
-    Computes the V-loss (Eq. 6 from paper):
-        L_V = ExpectileLoss(top-k(Q(s, z)) - V(s))
+    Expectile-loss для V-сети из формулы (6).
 
-    Args:
-        q_net_t     : target Q-network
-        v_net       : current value network
-        s           : batch of states, shape (B, state_dim)
-        z_ddpm      : latents sampled from diffusion model, (B, 500, L)
-        z_data      : latents from replay buffer, (B, 32, L)
-        k           : number of top Q-values to use
-        tau         : expectile (asymmetry coefficient)
-        lambda_v    : loss scale factor
-        return_stats: whether to return extra statistics
-
-    Returns:
-        loss: scalar loss
-        [optional stats]: gap, v_mean, q_mean, v_pred, q_sel
+    L_V = E_{s, z~μψ}[  |τ - I(u<0)| · u²  ],  u = Q(s,z) - V(s)
     """
-    B = s.size(0)
-    z_all = torch.cat([z_ddpm, z_data], dim=1)  # (B, 532, L)
-    n_all = z_all.size(1)
+    B, n_lat, _ = z_ddpm.shape
 
+    # ---------- Q(s, z) ----------
     with torch.no_grad():
-        s_rep = s.unsqueeze(1).expand(-1, n_all, -1)  # (B, n_all, state_dim)
+        s_rep = s.unsqueeze(1).expand(-1, n_lat, -1)       # (B, n_lat, state_dim)
         q1, q2 = q_net_t(
-            s_rep.reshape(-1, s.shape[-1]),
-            z_all.reshape(-1, z_all.shape[-1])
+            s_rep.reshape(-1, s.size(-1)),
+            z_ddpm.reshape(-1, z_ddpm.size(-1))
         )
-        q_vals = torch.min(q1, q2).view(B, n_all)  # clipped double Q
-        q_sel = torch.topk(q_vals, k=min(k, n_all), dim=1).values  # (B, k)
+        q_vals = torch.min(q1, q2).view(B, n_lat)          # (B, n_lat)
 
-    v_pred = v_net(s).unsqueeze(1)  # (B, 1)
-    u = q_sel - v_pred              # (B, k)
-    w = torch.where(u > 0, tau, 1 - tau)
-    loss = lambda_v * (w * u.pow(2)).mean()
-    
-    if return_stats:
-        gap = (q_sel.mean(dim=1) - v_pred.squeeze(1)).mean().detach()
-        return loss, gap, v_pred.mean().detach(), q_sel.mean().detach(), v_pred.detach(), q_sel.detach()
-    
-    return loss
+    # ---------- V(s) and expectile loss ----------
+    v_pred = v_net(s).unsqueeze(1)                         # (B, 1)
+    u = q_vals - v_pred                                    # (B, n_lat)
+    # w = torch.where(u > 0, tau, 1 - tau)                   # (B, n_lat)
+    w = torch.where(u > 0, tau, 1 - tau) 
+    return (w * u.pow(2)).mean()
 
 # -----------------------------------------------------------------------------
 # [6] Policy Execution: Latent Sampling, Adaptive Revaluation
 # -----------------------------------------------------------------------------
 
 @torch.no_grad()
-def policy_execute(
-    env:        gym.Env,
-    q_net:      DoubleQNet,
-    v_net:      ValueNet,
-    beta_vae:   BetaVAE,
+def diar_plan_latent(
     diffusion:  LatentDiffusionUNet,
+    beta_vae:   BetaVAE,
+    q_net:      DoubleQNet,
+    v_net:      Optional[ValueNet],
+    state:      torch.Tensor,         # (B_alive, s_dim)
     *,
-    latent_dim:     int = 16,
-    ddpm_steps:     int = 10,        # DDIM steps; "extra steps = 5"
-    n_latents:      int = 500,       # number of latent candidates
-    reval_attempts: int = 5,         # max resample attempts for AR
-    value_eps:      float = 0.2,     # tolerance for Adaptive Revaluation
-    device:         str = "cpu",
-    max_actions:    Optional[int] = None
+    n_latents:  int = 500,
+    ddpm_steps: int = 10,
+    value_eps:  float = 0.2,
+) -> torch.Tensor:
+    """
+    Batched latent selection with Adaptive Revaluation (один проход).
+    """
+    assert q_net is not None, "q_net required for planning"
+
+    B, _     = state.shape
+    device   = state.device
+    z_dim    = beta_vae.latent_dim
+
+    # DDIM sampling -------------------------------------------------------
+    z_pool = ddim_sample(
+        model      = diffusion,
+        s          = state.repeat_interleave(n_latents, dim=0),
+        latent_dim = z_dim,
+        T_ddim     = ddpm_steps,
+    )  # (B*n_latents, z_dim)
+
+    # Q-оценка ------------------------------------------------------------
+    rep_state = state.repeat_interleave(n_latents, 0)
+    q1, q2    = q_net(rep_state, z_pool)
+    q_min     = torch.min(q1, q2).view(B, n_latents)
+    best_idx  = q_min.argmax(dim=1)
+
+    best_latent = torch.stack([
+        z_pool[i*n_latents + best_idx[i]] for i in range(B)
+    ], dim=0)  # (B, z_dim)
+
+    # One-shot Adaptive Revaluation --------------------------------------
+    if v_net is not None:
+        s_pred  = beta_vae.decode_state(state, best_latent)
+        accept  = (v_net(s_pred) + value_eps >= v_net(state)).flatten()
+        if not accept.all():
+            bad_mask      = ~accept
+            s_bad         = state[bad_mask]
+            z_pool_bad    = ddim_sample(
+                model      = diffusion,
+                s          = s_bad.repeat_interleave(n_latents, 0),
+                latent_dim = z_dim,
+                T_ddim     = ddpm_steps,
+            )
+            q1b, q2b      = q_net(s_bad.repeat_interleave(n_latents, 0), z_pool_bad)
+            q_min_bad     = torch.min(q1b, q2b).view(-1, n_latents)
+            best_bad_idx  = q_min_bad.argmax(dim=1)
+            for j, idx in enumerate(best_bad_idx):
+                best_latent[bad_mask.nonzero(as_tuple=True)[0][j]] = \
+                    z_pool_bad[j*n_latents + idx]
+
+    return best_latent
+# --------------------------------------------------------------------------- #
+
+def augment_state(s_phys: torch.Tensor, goal_abs: torch.Tensor) -> torch.Tensor:
+    """
+    Args:
+        s_phys   : (B, 4)  – [x, y, vx, vy]
+        goal_abs : (B, 2)  – абсолютные координаты цели
+    Returns:
+        s_aug    : (B, 6)  – [x, y, vx, vy, goal_x-x, goal_y-y]
+    """
+    rel = goal_abs - s_phys[:, :2]          # (B, 2)
+    return torch.cat([s_phys, rel], dim=1)  # (B, 6)
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+@torch.no_grad()
+def evaluate_diar_policy(
+    envs:               list[gym.Env],
+    beta_vae:           BetaVAE,
+    diffusion_model:    LatentDiffusionUNet,
+    q_net:              Optional[DoubleQNet],
+    v_net:              Optional[ValueNet],
+    *,
+    num_evals:          int  = 100,
+    num_parallel_envs:  int  = 10,
+    n_latents:          int  = 500,
+    ddpm_steps:         int  = 10,
+    exec_horizon:       int  = 30,
+    device:             str  = "cuda",
+    render:             bool = False,
+    value_eps:          float= 0.2,
 ) -> float:
     """
-    Executes a DIAR policy in the environment (Algorithm 2).
-
-    Workflow:
-        1. For each state s:
-           - Generate N latent samples z_i using DDIM
-           - Select z* = argmax Q(s, z_i)
-           - Decode a*, s' ← BetaVAE(s, z*)
-           - Accept z* if V(s') ≥ V(s) - ε
-           - If not, resample up to `reval_attempts` times
-        2. Execute decoded action and update environment
-        3. Repeat until done or action limit
-
-    Returns:
-        float: total episode reward
+    Оценка DIAR-политики, строго повторяющая метрику maze2d-large из оригинального
+    кода.  Главное отличие от предыдущей версии — теперь мы используем
+    **аугментированное состояние** (6-мерное), на котором и обучались модели.
     """
+    torch_device   = torch.device(device)
+    state_dim_raw  = envs[0].observation_space.shape[0]      # 4
+    state_dim_aug  = state_dim_raw + 2                       # 6
+    goal_fixed     = torch.tensor([1.0, 1.0],
+                                  device=torch_device)       # (2,)
 
-    def augment(state_np: np.ndarray, goal_abs: np.ndarray) -> np.ndarray:
-        """
-        Concatenate relative goal to state: s_aug = [s, goal - pos]
-        """
-        return np.concatenate([state_np, goal_abs - state_np[:2]], axis=0)
+    MAX_STEPS      = 300
+    batches        = num_evals // num_parallel_envs
+    successes      = 0
+    raw_score_sum  = 0.0
 
-    # -------------------------------------------------------------------------
-    goal_abs = np.asarray(env.unwrapped._target, dtype=np.float32)
-    state_np = env.reset()
-    state_np = augment(state_np, goal_abs)
-    done = False
-    total_reward = 0.0
-    action_count = 0
-    max_actions = max_actions or env._max_episode_steps
+    for batch in range(batches):
+        # ── reset параллельных сред ────────────────────────────────────────
+        S_phys = torch.zeros((num_parallel_envs, state_dim_raw),
+                             device=torch_device)
+        S_aug  = torch.zeros((num_parallel_envs, state_dim_aug),
+                             device=torch_device)
+        goal   = goal_fixed.expand(num_parallel_envs, -1)
+        done   = torch.zeros(num_parallel_envs, dtype=torch.bool,
+                             device=torch_device)
+        succ   = torch.zeros_like(done)
 
-    while not done and action_count < max_actions:
-        # Convert state to torch tensor
-        state = torch.tensor(state_np, dtype=torch.float32, device=device).unsqueeze(0)  # (1, s_dim)
+        for k in range(num_parallel_envs):
+            s_np           = envs[k].reset()                # (4,)
+            S_phys[k]      = torch.tensor(s_np, device=torch_device)
+            S_aug[k]       = augment_state(S_phys[k:k+1], goal[k:k+1])
 
-        # Try multiple revaluation attempts
-        for _ in range(reval_attempts):
-            # Sample candidate latents via DDIM
-            z_pool = ddim_sample(
-                model=diffusion,
-                s=state.repeat(n_latents, 1),  # (B = n_latents, s_dim)
-                latent_dim=latent_dim,
-                T_ddim=ddpm_steps             # short reverse path
-            )  # → (B, latent_dim)
+        env_step = 0
+        # ── episode rollout ───────────────────────────────────────────────
+        while env_step < MAX_STEPS:
+            alive_idx = (~done).nonzero(as_tuple=True)[0]
+            if alive_idx.numel() == 0:
+                break  # все среды завершили эпизод
 
-            # Evaluate Q-values
-            q1, q2 = q_net(state.repeat(n_latents, 1), z_pool)
-            q_min = torch.min(q1, q2)
-            z_star = z_pool[q_min.argmax()].unsqueeze(0)  # select best latent (1, latent_dim)
+            # ── планируем лучший латент только для «живых» сред ──────────
+            best_z = diar_plan_latent(
+                diffusion   = diffusion_model,
+                beta_vae    = beta_vae,
+                q_net       = q_net,
+                v_net       = v_net,
+                state       = S_aug[alive_idx],     # (B_alive, 6)
+                n_latents   = n_latents,
+                ddpm_steps  = ddpm_steps,
+                value_eps   = value_eps,
+            )
 
-            # Decode action and next state
-            action_pred = beta_vae.decode_action(state, z_star)  # (1, a_dim)
-            state_pred  = beta_vae.decode_state(state, z_star)   # (1, s_dim)
+            # ── исполняем latent «exec_horizon» шагов ────────────────────
+            for _ in range(exec_horizon):
+                for i, k in enumerate(alive_idx.tolist()):
+                    if done[k]:
+                        continue
 
-            # Adaptive Revaluation
-            if v_net(state_pred) + value_eps >= v_net(state):
-                break  # Accept current z_star
+                    # действие по латенту
+                    action = beta_vae.decode_action(
+                        S_aug[k].unsqueeze(0),           # (1, 6)
+                        best_z[i].unsqueeze(0)           # (1, z_dim)
+                    ).squeeze(0).cpu().numpy()
 
-        # Execute decoded action in environment
-        action_np = action_pred.squeeze(0).cpu().detach().numpy()
-        state_np, reward, done, _ = env.step(action_np)
-        state_np = augment(state_np, goal_abs)
-        total_reward += reward
-        action_count += 1
+                    next_s, reward, terminated, _ = envs[k].step(action)
 
-    return total_reward
+                    if reward:                  # sparse reward at goal
+                        succ[k]   = True
+                        raw_score_sum += MAX_STEPS - env_step
+                        done[k]   = True
+
+                    # обновляем состояния
+                    S_phys[k] = torch.tensor(next_s, device=torch_device)
+                    S_aug[k]  = augment_state(
+                        S_phys[k:k+1], goal[k:k+1]).squeeze(0)
+
+                    if render and k == 0:
+                        envs[k].render()
+
+                env_step += 1
+                if env_step >= MAX_STEPS or done.all():
+                    break  # пора перепланировать или закончить эпизод
+
+        # ── статистика batch-а ─────────────────────────────────────────────
+        successes += succ.sum().item()
+        total      = (batch + 1) * num_parallel_envs
+        print(f"[{total:3d}/{num_evals}]  success {successes}"
+              f"  ({successes / total * 100:5.1f} %)")
+
+    # ── финальный вывод метрики D4RL ────────────────────────────────────────
+    avg_raw    = raw_score_sum / num_evals
+    d4rl_score = envs[0].get_normalized_score(avg_raw) * 100
+    # print(f"\nRaw return: {avg_raw:.1f} | Normalised D4RL: {d4rl_score:.2f}")
+    return d4rl_score
 
 # -----------------------------------------------------------------------------
 # [7] Replay Buffer: Prioritized Sampling (PER)
@@ -1203,17 +1347,189 @@ def train_diffusion_model(
 # [8.3] Phase 3 – DIAR Training Loop: Q / V
 # -----------------------------------------------------------------------------
 
+# def train_diar(
+#     env: gym.Env,
+#     *,
+#     dataset: dict,
+#     valid_mask: np.ndarray,
+#     beta_vae: BetaVAE,                # pretrained, frozen
+#     diffusion_model: LatentDiffusionUNet,  # pretrained, frozen
+#     state_dim: int,
+#     action_dim: int,
+#     latent_dim: int = 16,
+#     # ---------------- optimization params ------------------------------------
+#     num_steps: int = 100_000,
+#     horizon: int = 30,
+#     batch_size: int = 128,
+#     lr_q: float = 5e-4,
+#     lr_v: float = 5e-4,
+#     step_lr_iters: int = 50_000,
+#     device: str = "cuda",
+#     save_every: int = 10_000,
+#     save_dir: str = "output/diar",
+#     use_cache_rb: bool = True
+# ):
+#     """
+#     Trains DIAR Q-network and Value-network with a diffusion-model-guided replay buffer.
+
+#     Q-learning updates are performed using the β-VAE encoded latents z from the dataset.
+#     Value learning uses top-k Q(s, z) estimates from both diffusion-sampled and dataset latents.
+
+#     Args:
+#         env           : Gym environment for evaluation
+#         dataset       : D4RL dataset dict
+#         valid_mask    : boolean mask for valid sequences of length H
+#         beta_vae      : trained and frozen β-VAE model
+#         diffusion_model: trained and frozen LatentDiffusionUNet
+#         state_dim     : dimensionality of states
+#         action_dim    : dimensionality of actions
+#         latent_dim    : dimensionality of latent z
+#         num_steps     : total number of training steps
+#         horizon       : H (trajectory length used for encoding)
+#         batch_size    : number of samples per batch
+#         lr_q, lr_v    : learning rates for Q and V networks
+#         step_lr_iters : V-network LR scheduler step size
+#         save_every    : how often to checkpoint models
+#         save_dir      : path to save models
+#         use_cache_rb  : whether to cache/load the replay buffer
+#     """
+#     os.makedirs(save_dir, exist_ok=True)
+
+#     # ------------------- initialize Q / V networks ---------------------------
+#     beta_vae.eval()
+#     diffusion_model.eval()
+
+#     q_net   = DoubleQNet(state_dim, latent_dim).to(device)
+#     v_net   = ValueNet(state_dim).to(device)
+#     q_tgt   = DoubleQNet(state_dim, latent_dim).to(device)
+#     v_tgt   = ValueNet(state_dim).to(device)
+
+#     q_tgt.load_state_dict(q_net.state_dict())
+#     v_tgt.load_state_dict(v_net.state_dict())
+
+#     opt_q = torch.optim.Adam(q_net.parameters(), lr=lr_q)
+#     opt_v = torch.optim.Adam(v_net.parameters(), lr=lr_v)
+#     sched_v = torch.optim.lr_scheduler.StepLR(opt_v, step_size=step_lr_iters, gamma=0.3)
+
+#     # ------------------- prioritized replay buffer ---------------------------
+#     rb = build_replay_buffer(
+#         dataset=dataset,
+#         valid_mask=valid_mask,
+#         horizon=horizon,
+#         beta_vae=beta_vae,
+#         state_dim=state_dim,
+#         action_dim=action_dim,
+#         latent_dim=latent_dim,
+#         device=device,
+#         cache_path=os.path.join(save_dir, "replay_buffer.pt"),
+#         use_cache=use_cache_rb
+#     )
+
+#     # ------------------- training constants ----------------------------------
+#     tau = 0.9
+#     gamma = 0.995
+#     n_ddpm_lat = 500  # number of sampled latents from diffusion
+
+#     pbar = trange(num_steps, desc="DIAR-train")
+#     for step in pbar:
+#         # ====================== Q-network update ============================
+#         batch = rb.sample(batch_size)
+#         s = batch['state']        # (B, s_dim)
+#         z = batch['latent']       # (B, latent_dim)
+#         r = batch['reward']       # (B,)
+#         sn = batch['next_state']  # (B, s_dim)
+#         w = batch['weights']      # (B,1)
+#         idx = batch['indices']
+        
+#         with torch.no_grad():
+#             v_target = v_tgt(sn)                  # V(s')
+#             q_target = r + gamma * v_target       # r + γV(s')
+
+#         q1, q2 = q_net(s, z)
+#         q_pred = torch.min(q1, q2)                # clipped double Q
+#         td = q_target - q_pred                    # TD-error
+
+#         loss_q = (w.squeeze(1) * td.pow(2)).mean()
+
+#         opt_q.zero_grad()
+#         loss_q.backward()
+#         opt_q.step()
+
+#         # update priorities in replay buffer
+#         rb.update_priorities(idx, (td.abs() + 1e-6).detach())
+
+#         # ====================== V-network update ============================
+#         with torch.no_grad():
+#             # Sample z from diffusion model conditioned on s
+#             s_rep = s.repeat_interleave(n_ddpm_lat, 0)  # (B×500, s_dim)
+#             z_ddpm = ddim_sample(
+#                 model=diffusion_model,
+#                 s=s_rep,
+#                 latent_dim=latent_dim,
+#                 T_ddim=10
+#             ).view(batch_size, n_ddpm_lat, latent_dim)
+
+#             # Expand z from dataset for top-k matching
+#             z_data = z.unsqueeze(1).expand(-1, 32, -1)  # (B,32,L)
+
+#         loss_v = compute_v_loss(
+#             q_net_t=q_tgt,
+#             v_net=v_net,
+#             s=s,
+#             z_ddpm=z_ddpm,
+#             z_data=z_data,
+#             k=100,
+#             tau=tau,
+#             lambda_v=0.5
+#         )
+
+#         opt_v.zero_grad()
+#         loss_v.backward()
+#         torch.nn.utils.clip_grad_norm_(v_net.parameters(), 1.0)
+#         opt_v.step()
+#         sched_v.step()
+
+#         # ====================== soft update targets =========================
+#         with torch.no_grad():
+#             for p, tp in zip(q_net.parameters(), q_tgt.parameters()):
+#                 tp.mul_(0.995).add_(0.005 * p)
+#             for p, tp in zip(v_net.parameters(), v_tgt.parameters()):
+#                 tp.mul_(0.995).add_(0.005 * p)
+
+#         # ====================== evaluation logging ==========================
+#         if step % 500 == 0:
+#             rew = policy_execute(
+#                 env,
+#                 q_net=q_net,
+#                 v_net=v_net,
+#                 beta_vae=beta_vae,
+#                 diffusion=diffusion_model,
+#                 max_actions=150,
+#                 device=device
+#             )
+#             wandb.log({
+#                 "eval/reward": rew,
+#                 "loss/q": loss_q.item(),
+#                 "loss/v": loss_v.item()
+#             }, step=step + 550)
+#             pbar.set_postfix({"R": f"{rew:6.1f}"})
+
+#         # ====================== save checkpoints ============================
+#         if step % save_every == 0 or step == num_steps - 1:
+#             torch.save(q_net.state_dict(), os.path.join(save_dir, f"q_net_{step}.pt"))
+#             torch.save(v_net.state_dict(), os.path.join(save_dir, f"v_net_{step}.pt"))
+
 def train_diar(
-    env: gym.Env,
+    envs: list[gym.Env],
     *,
     dataset: dict,
     valid_mask: np.ndarray,
-    beta_vae: BetaVAE,                # pretrained, frozen
-    diffusion_model: LatentDiffusionUNet,  # pretrained, frozen
+    beta_vae: BetaVAE,                     # pretrained, frozen
+    diffusion_model: LatentDiffusionUNet, # pretrained, frozen
     state_dim: int,
     action_dim: int,
     latent_dim: int = 16,
-    # ---------------- optimization params ------------------------------------
+    # ---------------- optimization params ----------------------
     num_steps: int = 100_000,
     horizon: int = 30,
     batch_size: int = 128,
@@ -1226,48 +1542,27 @@ def train_diar(
     use_cache_rb: bool = True
 ):
     """
-    Trains DIAR Q-network and Value-network with a diffusion-model-guided replay buffer.
-
-    Q-learning updates are performed using the β-VAE encoded latents z from the dataset.
-    Value learning uses top-k Q(s, z) estimates from both diffusion-sampled and dataset latents.
-
-    Args:
-        env           : Gym environment for evaluation
-        dataset       : D4RL dataset dict
-        valid_mask    : boolean mask for valid sequences of length H
-        beta_vae      : trained and frozen β-VAE model
-        diffusion_model: trained and frozen LatentDiffusionUNet
-        state_dim     : dimensionality of states
-        action_dim    : dimensionality of actions
-        latent_dim    : dimensionality of latent z
-        num_steps     : total number of training steps
-        horizon       : H (trajectory length used for encoding)
-        batch_size    : number of samples per batch
-        lr_q, lr_v    : learning rates for Q and V networks
-        step_lr_iters : V-network LR scheduler step size
-        save_every    : how often to checkpoint models
-        save_dir      : path to save models
-        use_cache_rb  : whether to cache/load the replay buffer
+    Обучение Q-сети и V-сети согласно алгоритму 1 DIAR.
     """
     os.makedirs(save_dir, exist_ok=True)
 
-    # ------------------- initialize Q / V networks ---------------------------
+    # ---------------- сети и оптимизаторы -----------------------
     beta_vae.eval()
     diffusion_model.eval()
 
-    q_net   = DoubleQNet(state_dim, latent_dim).to(device)
-    v_net   = ValueNet(state_dim).to(device)
-    q_tgt   = DoubleQNet(state_dim, latent_dim).to(device)
-    v_tgt   = ValueNet(state_dim).to(device)
+    q_net = DoubleQNet(state_dim, latent_dim).to(device)
+    v_net = ValueNet(state_dim).to(device)
 
+    q_tgt = DoubleQNet(state_dim, latent_dim).to(device)
     q_tgt.load_state_dict(q_net.state_dict())
-    v_tgt.load_state_dict(v_net.state_dict())
 
     opt_q = torch.optim.Adam(q_net.parameters(), lr=lr_q)
     opt_v = torch.optim.Adam(v_net.parameters(), lr=lr_v)
-    sched_v = torch.optim.lr_scheduler.StepLR(opt_v, step_size=step_lr_iters, gamma=0.3)
+    sched_v = torch.optim.lr_scheduler.StepLR(
+        opt_v, step_size=step_lr_iters, gamma=0.3
+    )
 
-    # ------------------- prioritized replay buffer ---------------------------
+    # ---------------- приорит. буфер ----------------------------
     rb = build_replay_buffer(
         dataset=dataset,
         valid_mask=valid_mask,
@@ -1281,62 +1576,36 @@ def train_diar(
         use_cache=use_cache_rb
     )
 
-    # ------------------- training constants ----------------------------------
-    tau = 0.9
+    # ---------------- константы обучения ------------------------
+    tau   = 0.9
     gamma = 0.995
-    n_ddpm_lat = 500  # number of sampled latents from diffusion
+    n_ddpm_lat = 500                # число латентов из DDPM
 
     pbar = trange(num_steps, desc="DIAR-train")
     for step in pbar:
-        # ====================== Q-network update ============================
         batch = rb.sample(batch_size)
-        s = batch['state']        # (B, s_dim)
-        z = batch['latent']       # (B, latent_dim)
-        r = batch['reward']       # (B,)
-        sn = batch['next_state']  # (B, s_dim)
-        w = batch['weights']      # (B,1)
+        s   = batch['state']
+        z   = batch['latent']
+        r   = batch['reward']
+        sn  = batch['next_state']
+        w   = batch['weights']
         idx = batch['indices']
-        
+
+        # =============== V-update ==============================
         with torch.no_grad():
-            v_target = v_tgt(sn)                  # V(s')
-            q_target = r + gamma * v_target       # r + γV(s')
-
-        q1, q2 = q_net(s, z)
-        q_pred = torch.min(q1, q2)                # clipped double Q
-        td = q_target - q_pred                    # TD-error
-
-        loss_q = (w.squeeze(1) * td.pow(2)).mean()
-
-        opt_q.zero_grad()
-        loss_q.backward()
-        opt_q.step()
-
-        # update priorities in replay buffer
-        rb.update_priorities(idx, (td.abs() + 1e-6).detach())
-
-        # ====================== V-network update ============================
-        with torch.no_grad():
-            # Sample z from diffusion model conditioned on s
-            s_rep = s.repeat_interleave(n_ddpm_lat, 0)  # (B×500, s_dim)
             z_ddpm = ddim_sample(
                 model=diffusion_model,
-                s=s_rep,
+                s=s.repeat_interleave(n_ddpm_lat, 0),
                 latent_dim=latent_dim,
                 T_ddim=10
             ).view(batch_size, n_ddpm_lat, latent_dim)
-
-            # Expand z from dataset for top-k matching
-            z_data = z.unsqueeze(1).expand(-1, 32, -1)  # (B,32,L)
 
         loss_v = compute_v_loss(
             q_net_t=q_tgt,
             v_net=v_net,
             s=s,
             z_ddpm=z_ddpm,
-            z_data=z_data,
-            k=100,
-            tau=tau,
-            lambda_v=0.5
+            tau=tau
         )
 
         opt_v.zero_grad()
@@ -1345,22 +1614,36 @@ def train_diar(
         opt_v.step()
         sched_v.step()
 
-        # ====================== soft update targets =========================
+        # =============== Q-update ==============================
+        with torch.no_grad():
+            v_bootstrap = v_net(sn)                  # online V (detach)
+            q_target    = r + gamma * v_bootstrap
+
+        q1, q2 = q_net(s, z)
+        q_pred = torch.min(q1, q2)
+        td     = q_target - q_pred                   # TD-ошибка
+
+        loss_q = (w.squeeze(1) * td.pow(2)).mean()
+
+        opt_q.zero_grad()
+        loss_q.backward()
+        opt_q.step()
+
+        rb.update_priorities(idx, (td.abs() + 1e-6).detach())
+
+        # =============== soft-update Q-таргета =================
         with torch.no_grad():
             for p, tp in zip(q_net.parameters(), q_tgt.parameters()):
                 tp.mul_(0.995).add_(0.005 * p)
-            for p, tp in zip(v_net.parameters(), v_tgt.parameters()):
-                tp.mul_(0.995).add_(0.005 * p)
 
-        # ====================== evaluation logging ==========================
+        # =============== evaluation / логгинг ==================
         if step % 500 == 0:
-            rew = policy_execute(
-                env,
+            rew = evaluate_diar_policy(
+                envs,
                 q_net=q_net,
                 v_net=v_net,
                 beta_vae=beta_vae,
-                diffusion=diffusion_model,
-                max_actions=150,
+                diffusion_model=diffusion_model,
                 device=device
             )
             wandb.log({
@@ -1370,7 +1653,7 @@ def train_diar(
             }, step=step + 550)
             pbar.set_postfix({"R": f"{rew:6.1f}"})
 
-        # ====================== save checkpoints ============================
+        # =============== сохранения ============================
         if step % save_every == 0 or step == num_steps - 1:
             torch.save(q_net.state_dict(), os.path.join(save_dir, f"q_net_{step}.pt"))
             torch.save(v_net.state_dict(), os.path.join(save_dir, f"v_net_{step}.pt"))
@@ -1455,6 +1738,7 @@ def main():
     """
     parser = argparse.ArgumentParser()
     parser.add_argument("--env",        default="maze2d-umaze-v1", help="Gym environment name")
+    parser.add_argument("--parallel_envs", default=10, type=int)
     parser.add_argument("--device",     default="cuda",            help="Device to use: cuda or cpu")
     parser.add_argument("--save_dir",   default="output",          help="Directory to store checkpoints and outputs")
     parser.add_argument("--latent_dim", default=16, type=int,      help="Dimensionality of β-VAE latent space")
@@ -1468,8 +1752,8 @@ def main():
         os.makedirs(os.path.join(args.save_dir, sub), exist_ok=True)
 
     # ------------------- Load D4RL dataset ----------------------------------
-    env = gym.make(args.env)
-    dset = env.get_dataset()
+    envs = [gym.make(args.env) for _ in range(args.parallel_envs)]
+    dset = envs[0].get_dataset()
 
     obs = dset["observations"]         # (N, 4)
     goal = dset["infos/goal"]          # (N, 2)
@@ -1528,7 +1812,7 @@ def main():
 
     # ------------------- (3) DIAR Q / V Training ----------------------------
     train_diar(
-        env              = env,
+        envs             = envs,
         dataset          = dset,
         valid_mask       = valid_mask,
         beta_vae         = beta_vae,         # frozen
